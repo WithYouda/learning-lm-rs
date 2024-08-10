@@ -71,25 +71,59 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
+    let ndim = y.shape().len();
+    assert!(ndim >= 2);
+
+    let _y = unsafe{y.data_mut()};
+    let _x = x.data();
+    let _w = w.data();
+    let seq = x.shape()[ndim - 2];
+    let cow = x.shape()[ndim - 1];
+
+    for i in 0..seq{
+        let sum = (0..cow)
+        .map(|j| {
+            let squ = _x[i*cow + j].powf(2.0);
+            squ
+        })
+        .sum::<f32>();
+        let sum_squ = ((sum / cow as f32)+ epsilon).sqrt();
+        for j in 0..cow{
+            _y[i*cow + j] = ((_w[j]) * (_x[i*cow + j])) / sum_squ;
+        }
+    }
+    
 }
 
 // y = sigmoid(x) * x * y
 // hint: this is an element-wise operation
 pub fn silu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    // let len = y.size();
-    // assert!(len == x.size());
+    let len = y.size();
+    assert!(len == x.size());
 
-    // let _y = unsafe { y.data_mut() };
-    // let _x = x.data();
-
-    todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
+    let _y = unsafe { y.data_mut() };
+    let _x = x.data();
+    for i in 0..len{
+        _y[i] = 1.0 / (1.0 + (-_x[i]).exp()) * _x[i] * _y[i];
+    }
 }
 
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
+    let nidm = c.shape().len();
+    let len = c.size();
+    let _c = unsafe{c.data_mut()};
+    let a_cow = a.shape()[nidm-1];
+    let b_seq = b.shape()[nidm-2];
+    let b_cow = b.shape()[nidm-1];
+    for i in 0..len{
+        let a_shape = vec![1,a_cow];
+        let a_ten = a.slice((i/b_seq)*a_cow,&a_shape);
+        let b_shape = vec![1,b_cow];
+        let b_ten = b.slice(i%b_seq*b_cow,&b_shape);
+        _c[i] = alpha * dot(&a_ten, &b_ten) + _c[i] * beta;
+    }
 }
 
 // Dot product of two tensors (treated as vectors)
@@ -204,6 +238,7 @@ fn test_matmul_transb() {
     let a = Tensor::<f32>::new(vec![1., 2., 3., 4., 5., 6.], &vec![2, 3]);
     let b = Tensor::<f32>::new(vec![1., 2., 3., 4., 5., 6.], &vec![2, 3]);
     matmul_transb(&mut c, 1., &a, &b, 1.);
+    c.print();
     assert!(c.close_to(
         &Tensor::<f32>::new(vec![15., 34., 35., 81.], &vec![2, 2]),
         1e-3
