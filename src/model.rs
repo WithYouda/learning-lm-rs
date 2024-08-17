@@ -31,6 +31,10 @@ impl Llama<f32> {
         let model_file = std::fs::read(model_dir.as_ref().join("model.safetensors")).unwrap();
         let safetensor = SafeTensors::deserialize(&model_file).unwrap();
         let params = LLamaParams::from_safetensors(&safetensor, &config);
+        // test
+        for i in safetensor.names(){
+            println!("{}",i)
+        }
 
         Self {
             vocab: config.vocab_size,
