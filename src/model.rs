@@ -8,6 +8,8 @@ use crate::params::LLamaParams;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
 use std::path::Path;
+
+#[allow(unused)]
 pub struct Llama<T> {
     vocab: usize,           // vocab size
     n_layers: usize,        // number of layers
@@ -31,11 +33,6 @@ impl Llama<f32> {
         let model_file = std::fs::read(model_dir.as_ref().join("model.safetensors")).unwrap();
         let safetensor = SafeTensors::deserialize(&model_file).unwrap();
         let params = LLamaParams::from_safetensors(&safetensor, &config);
-        // test
-        for i in safetensor.names(){
-            println!("{}",i)
-        }
-
         Self {
             vocab: config.vocab_size,
             n_layers: config.num_hidden_layers,
@@ -85,7 +82,7 @@ impl Llama<f32> {
                 self.eps,
             );
 
-            let q = (&mut q_buf).reshape(&vec![seq_len, self.n_q_h * self.dqkv]); // (seq, n_h * dqkv)
+            let q = (&mut q_buf).reshape(&vec![seq_len, self.n_q_h * self.dqkv]); // (seq, n_q_h * dqkv)
             let k = &mut cache.k_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
             let v = &mut cache.v_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
             OP::matmul_transb(q, 0., &hidden_states, &self.params.wq[layer], 1.0);
@@ -105,10 +102,35 @@ impl Llama<f32> {
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
-            todo!("self_attention(...)");
-            todo!("down_proj matmul and add residual");
+            self_attention(
+                &mut hidden_states,
+                &mut att_scores,
+                q,
+                full_k,
+                full_v,
+                self.n_kv_h,
+                n_groups,
+                seq_len,
+                total_seq_len,
+                self.dqkv
+            );
 
-            todo!("mlp(...)");
+            // todo!("down_proj matmul and add residual");
+            // residual = hidden_states @ wo.T + residual
+            OP::matmul_transb(&mut residual, 1., &hidden_states, &self.params.wo[layer], 1.);
+            //todo!("mlp(...)");
+            hidden_states = Tensor::<f32>::default(&vec![seq_len, self.d]);
+            mlp(
+                &mut residual,
+                &mut hidden_states,
+                &mut gate_buf,
+                &mut up_buf,
+                &self.params.w_up[layer],
+                &self.params.w_down[layer],
+                &self.params.w_gate[layer],
+                &self.params.rms_ffn_w[layer],
+                self.eps
+            )
         }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
@@ -129,6 +151,7 @@ impl Llama<f32> {
         logits
     }
 
+    #[allow(unused)]
     pub fn generate(
         &self,
         token_ids: &[u32],
@@ -139,11 +162,62 @@ impl Llama<f32> {
     ) -> Vec<u32>{
         let mut result = Vec::<u32>::new();
         
-        todo!("实现文本生成");
+        // todo!("实现文本生成");
+        // step 1
+        // initialize kvcache
+        let mut cache = self.new_cache();
+        // push token_ids into result
+        for token in token_ids{
+            result.push(*token);
+        }
+        let mut input_tensor = Tensor::new(token_ids.to_vec(), &vec![1,token_ids.len()]);
         
+        // random_sample and push into result
+        for _ in 0..max_len{
+            let forward_tensor = self.forward(&input_tensor, &mut cache);
+            let id = OP::random_sample(&forward_tensor, top_p, top_k, temperature);
+            if id == self.eos_token_id {
+                break;
+            }
+            result.push(id);
+            input_tensor = Tensor::new(vec![id],&vec![1, 1]);
+        }
         result
     }
+
+    // TODO: chat function
+    pub fn chat(
+        &self,
+        token_ids: &[u32],
+        max_len: usize,
+        top_p: f32,
+        top_k: u32,
+        temperature: f32,
+        mut cache: KVCache<f32>,
+    ) -> (Vec<u32>, KVCache<f32>){
+        let length = token_ids.len();
+        let mut result = Vec::<u32>::new();
+        let token: Vec<u32> = Vec::from(token_ids);
+        for token in token_ids{
+            result.push(*token);
+        }
+        let mut input = Tensor::<u32>::new(token, &vec![1, token_ids.len()]);
+        loop {
+            let output = OP::random_sample(&self.forward(&input, &mut cache), top_p, top_k, temperature);
+            result.push(output);
+            if result.len() >= max_len || output == self.eos_token_id {
+                break;
+            }
+            input = Tensor::<u32>::new(Vec::from([output]), &vec![1, 1]);
+        }
+        result = result[length..].to_vec();
+        (result, cache)
+    }
+
 }
+
+
+
 
 fn self_attention(
     hidden_states: &mut Tensor<f32>, // (seq, n_kv_h * n_groups * dqkv)
@@ -157,7 +231,66 @@ fn self_attention(
     total_seq_len: usize,
     dqkv: usize,
 ) {
-    todo!("Implement self_attention");
+    // step 1 ,socre = Q @ K.T / sqrt(dim) 
+    let sqrt_dim = (dqkv as f32).sqrt();
+    let scores = unsafe{att_scores.data_mut()};
+    for i in 0..seq_len{
+        for j in 0..total_seq_len{
+            for m in 0..n_kv_h{
+                for n in 0..n_groups{
+                    let q_start = (m * n_groups + n) * dqkv + i * n_groups * n_kv_h * dqkv;
+                    let q_= q.slice(q_start, &vec![dqkv, 1]);
+                    let k_start = m * dqkv + j *  n_kv_h * dqkv;
+                    let k_: Tensor<f32> = k.slice(k_start, &vec![dqkv, 1]);
+                    let value = OP::dot(&q_, &k_) / sqrt_dim;
+                    scores[m * n_groups * seq_len * total_seq_len 
+                        + n * seq_len * total_seq_len 
+                        + i * total_seq_len
+                        + j] 
+                        = value;
+                }
+            }
+        }
+    }
+    // step 2, attn = softmax(score)
+    OP::masked_softmax(att_scores);
+    // step 3, x = attn @ V
+    // attn (n_kv_head, n_group, seq_len, total_seq_len) --> n_kv_head * n_group * (seq_len, total_seq_len)
+    // attn_slice = (seq_len, total_seq_len)
+    // v (total_seq_len, n_kv_head * head_size) --> v.T (n_kv_head * head_size, total_seq_len)
+    // v.T (n_kv_head * head_size, total_seq_len) --> n_kv_head * (head_size, total_seq_len)
+    // v.T_slice = (head_size, total_seq_len)
+    // matmul_transb (attn_slice , v.T_slice) = (seq_len, head_size)
+    // hidden_state = attn @ V = n_kv_head * n_group * (seq_len, head_size) = (seq_len, n_kv_head * n_group * head_size) 
+    let v_data = v.data();
+    let hidden_len = n_kv_h * n_groups * dqkv;
+    let hidden = unsafe{hidden_states.data_mut()};
+    for i in 0..n_kv_h{
+        for j in 0..n_groups{
+            let attn_start = (i * n_groups + j) * seq_len * total_seq_len;
+            let attn_slice = &att_scores.slice(attn_start, &vec![seq_len, total_seq_len]);
+            // reverse v
+            let mut v_rev = vec![0.; dqkv * total_seq_len];
+            for m in 0..dqkv{
+                for n in 0..total_seq_len{
+                    v_rev[m * total_seq_len + n] = v_data[n * dqkv * n_kv_h + i * dqkv + m];
+                }
+            }
+            let v_rev_tensor = Tensor::new(v_rev, &vec![dqkv, total_seq_len]);
+            // matmul_transb result
+            let mut mat_result = Tensor::default(&vec![seq_len, dqkv]);
+            OP::matmul_transb(&mut mat_result, 0., &attn_slice, &v_rev_tensor, 1.);
+            // hidden_state
+            let mat_data = mat_result.data();
+            for row in 0..seq_len{
+                for col in 0..dqkv{
+                    hidden[hidden_len * row + (i * n_groups + j) * dqkv + col] = mat_data[row * dqkv + col];
+                }
+            }
+        }
+    }
+
+
 }
 
 fn mlp(
@@ -175,13 +308,7 @@ fn mlp(
     OP::matmul_transb(gate,0.0,hidden_states,w_gate,1.0);
     OP::matmul_transb(up,0.0,hidden_states,w_up,1.0);
     OP::silu(up,gate);
-    OP::matmul_transb(hidden_states,0.0,up,w_down,1.0);
-    let len = residual.size();
-    let r = unsafe{residual.data_mut()};
-    let h = hidden_states.data();
-    for i in 0..len{
-        r[i] = h[i] + r[i];
-    }
+    OP::matmul_transb(residual,1.0,up,w_down,1.0);
 }
 
 #[test]
@@ -250,4 +377,22 @@ pub fn test_load_safetensors() {
     assert!(float_eq(&model.params.wv[0].data()[100], &0.041015625, 1e-6));
     assert!(float_eq(&model.params.wo[0].data()[100], &0.01965332, 1e-6));
 
+}
+
+#[test]
+pub fn test_self_attention() {
+use std::path::PathBuf;
+use tokenizers::Tokenizer;
+
+    let project_dir = env!("CARGO_MANIFEST_DIR");
+    let model_dir = PathBuf::from(project_dir).join("models").join("story");
+    let llama = Llama::<f32>::from_safetensors(&model_dir);
+    let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
+    let input = "Once upon a time";
+    let binding = tokenizer.encode(input, true).unwrap();
+    let input_ids = binding.get_ids();
+    print!("\n{}", input);
+    let mut cache = llama.new_cache();
+    let input_tensor = Tensor::new(input_ids.to_vec(), &vec![1,input_ids.len()]);
+    llama.forward(&input_tensor, &mut cache).print();
 }

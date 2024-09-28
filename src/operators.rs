@@ -71,29 +71,75 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
+    assert!(y.size() == x.size());
+    // 获取维度数
     let ndim = y.shape().len();
+    // 确保至少有2个维度
     assert!(ndim >= 2);
-
-    let _y = unsafe{y.data_mut()};
+    // 序列的数量
+    let seq_len = y.shape()[ndim - 2];
+    // 每个序列的特征长度
+    let total_seq_len = y.shape()[ndim - 1];
+    // 获取维度数
+    let wdim = w.shape().len();
+    // 确保只有1个维度
+    assert!(wdim == 1);
+    // 确保长度相同
+    assert!(w.size() == total_seq_len);
+    // 批次数量
+    let batch = y.size() / (seq_len * total_seq_len);
+    // 获取数据的引用
+    let _y = unsafe { y.data_mut() };
     let _x = x.data();
     let _w = w.data();
-    let seq = x.shape()[ndim - 2];
-    let cow = x.shape()[ndim - 1];
-
-    for i in 0..seq{
-        let sum = (0..cow)
-        .map(|j| {
-            let squ = _x[i*cow + j].powf(2.0);
-            squ
-        })
-        .sum::<f32>();
-        let sum_squ = ((sum / cow as f32)+ epsilon).sqrt();
-        for j in 0..cow{
-            _y[i*cow + j] = ((_w[j]) * (_x[i*cow + j])) / sum_squ;
+    // 遍历每个批次
+    for b in 0..batch {
+        // 当前批次的基索引
+        let base = b * seq_len * total_seq_len;
+        // 遍历批次中的每个序列
+        for l in 0..seq_len {
+            // 当前序列的偏移量
+            let offset = base + l * total_seq_len;
+            // 平方和
+            let s: f32 = _x[offset..offset + total_seq_len]
+                .iter()
+                .map(|f| f * f)
+                .sum();
+            let sqrt = (s / total_seq_len as f32 + epsilon).sqrt();
+            // 计算并储存结果
+            for i in 0..total_seq_len {
+                _y[offset + i] = _w[i] * _x[offset + i] / sqrt;
+            }
         }
     }
     
+  // 修改前的代码
+  /*
+  let ndim = y.shape().len();
+  assert!(ndim >= 2);
+
+  let _y = unsafe{y.data_mut()};
+  let _x = x.data();
+  let _w = w.data();
+  let seq = x.shape()[ndim - 2];
+  let cow = x.shape()[ndim - 1];
+
+  for i in 0..seq{
+      let sum = (0..cow)
+      .map(|j| {
+          // 此处会出现访问数组越界错误！
+          let squ = _x[i*cow + j].powf(2.0);
+          squ
+      })
+      .sum::<f32>();
+      let sum_squ = ((sum / cow as f32)+ epsilon).sqrt();
+      for j in 0..cow{
+          _y[i*cow + j] = ((_w[j]) * (_x[i*cow + j])) / sum_squ;
+      }
+  }
+   */
 }
+
 
 // y = sigmoid(x) * x * y
 // hint: this is an element-wise operation
@@ -111,18 +157,37 @@ pub fn silu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    let nidm = c.shape().len();
-    let len = c.size();
-    let _c = unsafe{c.data_mut()};
-    let a_cow = a.shape()[nidm-1];
-    let b_seq = b.shape()[nidm-2];
-    let b_cow = b.shape()[nidm-1];
-    for i in 0..len{
-        let a_shape = vec![1,a_cow];
-        let a_ten = a.slice((i/b_seq)*a_cow,&a_shape);
-        let b_shape = vec![1,b_cow];
-        let b_ten = b.slice(i%b_seq*b_cow,&b_shape);
-        _c[i] = alpha * dot(&a_ten, &b_ten) + _c[i] * beta;
+    // 确保 A 和 B 能进行矩阵乘法
+    assert!(a.shape().len() == b.shape().len());
+    // 确保 A 和 C 能进行矩阵加法
+    assert!(a.shape().len() == c.shape().len());
+
+    let ndim = a.shape().len();
+    assert!(ndim >= 2);
+    let a_row = a.shape()[ndim - 2];
+    let a_col = a.shape()[ndim - 1];
+
+    let b_row = b.shape()[ndim - 2];
+    let b_col = b.shape()[ndim - 1];
+
+    let c_row = c.shape()[ndim - 2];
+    let c_col = c.shape()[ndim - 1];
+
+    let _c = unsafe { c.data_mut() };
+    let _a = a.data();
+    let _b = b.data();
+
+    assert!(a_col == b_col);
+    assert!(c_col == b_row);
+    assert!(a_row == c_row);
+
+    for l in 0..c_row {
+        for i in 0..c_col {
+            let sum = (0..a_col)
+                .map(|j| _a[l * a_col + j] * _b[i * b_col + j])
+                .sum::<f32>();
+            _c[l * c_col + i] = beta * _c[l * c_col + i] + alpha * sum;
+        }
     }
 }
 
