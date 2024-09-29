@@ -28,8 +28,14 @@ for name, layer in model.named_modules():
 with torch.no_grad():
     model(**inputs)
 
-x = outputs_dict['transformer_layer_model.layers.0']['output'][0]
+#x_r = torch.tensor(
+    
+    
+    
+#)
 
+x = outputs_dict['transformer_layer_lm_head']['output'][0]
+
+#print(x - x_r > 100)
 print(x)
-
 

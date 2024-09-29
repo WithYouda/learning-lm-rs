@@ -1,7 +1,7 @@
 use std::{usize, vec};
-
 use crate::tensor::Tensor;
-pub struct KVCache<T> {
+use num_traits::float::Float;
+pub struct KVCache<T: Float> {
     k_cache: Vec<Tensor<T>>, // (max_seq_len, n_kv_head * dqkv) x layers
     v_cache: Vec<Tensor<T>>, // (max_seq_len, n_kv_head * dqkv) x layers
     #[allow(unused)]
@@ -10,7 +10,7 @@ pub struct KVCache<T> {
     length: usize, // length of the current sequence
 }
 
-impl<T: Default + Copy> KVCache<T> {
+impl<T: Float + Default + Copy> KVCache<T> {
     pub fn new(n_layers: usize, max_seq_len: usize, dim: usize, init_len: usize) -> Self {
         KVCache {
             k_cache: (0..n_layers)

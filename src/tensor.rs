@@ -1,4 +1,6 @@
 use std::{slice, sync::Arc, vec};
+use num_traits::float::Float;
+use num_traits::FromPrimitive;
 pub struct Tensor<T> {
     data: Arc<Box<[T]>>,
     shape: Vec<usize>,
@@ -6,7 +8,7 @@ pub struct Tensor<T> {
     length: usize,
 }
 
-impl<T: Copy + Clone + Default> Tensor<T> {
+impl<T: Float + Copy + Clone + Default> Tensor<T> {
     pub fn new(data: Vec<T>, shape: &Vec<usize>) -> Self {
         let length = data.len();
         Tensor {
@@ -32,14 +34,7 @@ impl<T: Copy + Clone + Default> Tensor<T> {
         slice::from_raw_parts_mut(ptr, self.length)
     }
 
-    pub fn shape(&self) -> &Vec<usize> {
-        &self.shape
-    }
-
-    pub fn size(&self) -> usize {
-        self.length
-    }
-
+   
     // Reinterpret the tensor as a new shape while preserving total size.
     pub fn reshape(&mut self, new_shape: &Vec<usize>) -> &mut Self {
         let new_length: usize = new_shape.iter().product();
@@ -63,15 +58,38 @@ impl<T: Copy + Clone + Default> Tensor<T> {
     }
 }
 
+impl <T: Copy + Clone + Default> Tensor<T>{
+    pub fn shape(&self) -> &Vec<usize> {
+        &self.shape
+    }
+
+    pub fn size(&self) -> usize {
+        self.length
+    }
+    pub fn data_usize(&self) -> &[T] {
+        &self.data[self.offset..][..self.length]
+    }
+    pub fn new_usize(data: Vec<T>, shape: &Vec<usize>) -> Self {
+        let length = data.len();
+        Tensor {
+            data: Arc::new(data.into_boxed_slice().try_into().unwrap()),
+            shape: shape.clone(),
+            offset: 0,
+            length: length,
+        }
+    }
+}
+
+
 // Some helper functions for testing and debugging
-impl Tensor<f32> {
+impl<T: Float + std::fmt::Debug + Default + FromPrimitive> Tensor<T> {
     #[allow(unused)]
-    pub fn close_to(&self, other: &Self, rel: f32) -> bool {
+    pub fn close_to(&self, other: &Self, rel: T) -> bool {
         if self.shape() != other.shape() {
             return false;
         }
-        let a = self.data();
-        let b = other.data();
+        let a: &[T] = self.data();
+        let b: &[T] = other.data();
 
         return a.iter().zip(b).all(|(x, y)| float_eq(x, y, rel));
     }
@@ -91,6 +109,10 @@ impl Tensor<f32> {
 }
 
 #[inline]
-pub fn float_eq(x: &f32, y: &f32, rel: f32) -> bool {
-    (x - y).abs() <= rel * (x.abs() + y.abs()) / 2.0
+pub fn float_eq<T: Float>(x: &T, y: &T, rel: T) -> bool 
+where
+    T: Float + FromPrimitive
+{
+    let two = T::from_f64(2.0).unwrap();
+    (*x - *y).abs() <= rel * (x.abs() + y.abs()) / two
 }

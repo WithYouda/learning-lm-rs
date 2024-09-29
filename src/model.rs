@@ -1,16 +1,20 @@
 use std::fs::File;
 use std::vec;
+use safetensors::SafeTensors;
+use std::path::Path;
+use num_traits::float::Float;
+use num_traits::Num;
+use num_traits::FromPrimitive;
 
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
 use crate::operators as OP;
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
-use safetensors::SafeTensors;
-use std::path::Path;
+
 
 #[allow(unused)]
-pub struct Llama<T> {
+pub struct Llama<T: Num> {
     vocab: usize,           // vocab size
     n_layers: usize,        // number of layers
     n_q_h: usize,           // number of heads for q
@@ -26,35 +30,46 @@ pub struct Llama<T> {
     eos_token_id: u32,      // end token id
 }
 
-impl Llama<f32> {
-    pub fn from_safetensors(model_dir: impl AsRef<Path>) -> Self {
-        let config = File::open(model_dir.as_ref().join("config.json")).unwrap();
-        let config: LlamaConfigJson = serde_json::from_reader(config).unwrap();
-        let model_file = std::fs::read(model_dir.as_ref().join("model.safetensors")).unwrap();
-        let safetensor = SafeTensors::deserialize(&model_file).unwrap();
-        let params = LLamaParams::from_safetensors(&safetensor, &config);
-        Self {
-            vocab: config.vocab_size,
-            n_layers: config.num_hidden_layers,
-            n_q_h: config.num_attention_heads,
-            n_kv_h: config.num_key_value_heads,
-            d: config.hidden_size,
-            dqkv: config.hidden_size / config.num_attention_heads,
-            di: config.intermediate_size,
-            eps: config.rms_norm_eps,
-            rope_theta: config.rope_theta,
-            max_seq_len: config.max_position_embeddings,
-            params: params,
-            bos_token_id: config.bos_token_id,
-            eos_token_id: config.eos_token_id,
-        }
-    }
+macro_rules! impl_from_safetensors_for_Llama {
+    ($Param:ty) => {
+        impl Llama<$Param> {
+            pub fn from_safetensors(model_dir: impl AsRef<Path>) -> Self {
+                let config = File::open(model_dir.as_ref().join("config.json")).unwrap();
+                let config: LlamaConfigJson = serde_json::from_reader(config).unwrap();
+                let model_file =
+                    std::fs::read(model_dir.as_ref().join("model.safetensors")).unwrap();
+                let safetensor = SafeTensors::deserialize(&model_file).unwrap();
 
-    pub fn new_cache(&self) -> KVCache<f32> {
+                assert!(config.num_attention_heads % config.num_key_value_heads == 0);
+                Self {
+                    vocab: config.vocab_size,
+                    n_layers: config.num_hidden_layers,
+                    n_q_h: config.num_attention_heads,
+                    n_kv_h: config.num_key_value_heads,
+                    d: config.hidden_size,
+                    dqkv: config.hidden_size / config.num_attention_heads,
+                    di: config.intermediate_size,
+                    eps: config.rms_norm_eps,
+                    rope_theta: config.rope_theta,
+                    max_seq_len: config.max_position_embeddings,
+                    params: LLamaParams::<$Param>::from_safetensors(&safetensor, &config),
+                    bos_token_id: config.bos_token_id,
+                    eos_token_id: config.eos_token_id,
+                }
+            }
+        }
+    };
+}
+
+impl_from_safetensors_for_Llama!(f32);
+impl_from_safetensors_for_Llama!(half::f16);
+
+impl <T: Float + Default + std::iter::Sum + num_traits::FromPrimitive + std::fmt::Debug + std::ops::MulAssign>Llama<T> {
+    pub fn new_cache(&self) -> KVCache<T> {
         KVCache::new(self.n_layers, self.max_seq_len, self.n_kv_h * self.dqkv, 0)
     }
 
-    pub fn forward(&self, input: &Tensor<u32>, cache: &mut KVCache<f32>) -> Tensor<f32> {
+    pub fn forward(&self, input: &Tensor<u32>, cache: &mut KVCache<T>) -> Tensor<T> {
         let seq_len = input.size();
         let past_seq_len = cache.len();
         cache.increment(seq_len);
@@ -62,13 +77,13 @@ impl Llama<f32> {
         let n_groups = self.n_q_h / self.n_kv_h;
 
         // Some pre-allocated buffers that will be reused
-        let mut residual = Tensor::<f32>::default(&vec![seq_len, self.d]);
-        let mut hidden_states = Tensor::<f32>::default(&vec![seq_len, self.d]);
-        let mut q_buf = Tensor::<f32>::default(&vec![seq_len, self.n_q_h * self.dqkv]);
-        let mut att_scores =
-            Tensor::<f32>::default(&vec![self.n_kv_h, n_groups, seq_len, total_seq_len]);
-        let mut gate_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
-        let mut up_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
+        let mut residual: Tensor<T> = Tensor::<T>::default(&vec![seq_len, self.d]);
+        let mut hidden_states: Tensor<T> = Tensor::<T>::default(&vec![seq_len, self.d]);
+        let mut q_buf: Tensor<T> = Tensor::<T>::default(&vec![seq_len, self.n_q_h * self.dqkv]);
+        let mut att_scores: Tensor<T> =
+            Tensor::<T>::default(&vec![self.n_kv_h, n_groups, seq_len, total_seq_len]);
+        let mut gate_buf: Tensor<T> = Tensor::<T>::default(&vec![seq_len, self.di]);
+        let mut up_buf: Tensor<T> = Tensor::<T>::default(&vec![seq_len, self.di]);
 
         // Computation Starts Here
         // Embedding lookup
@@ -85,9 +100,9 @@ impl Llama<f32> {
             let q = (&mut q_buf).reshape(&vec![seq_len, self.n_q_h * self.dqkv]); // (seq, n_q_h * dqkv)
             let k = &mut cache.k_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
             let v = &mut cache.v_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
-            OP::matmul_transb(q, 0., &hidden_states, &self.params.wq[layer], 1.0);
-            OP::matmul_transb(k, 0., &hidden_states, &self.params.wk[layer], 1.0);
-            OP::matmul_transb(v, 0., &hidden_states, &self.params.wv[layer], 1.0);
+            OP::matmul_transb(q, T::from(0.).unwrap(), &hidden_states, &self.params.wq[layer], T::from(1.).unwrap());
+            OP::matmul_transb(k, T::from(0.).unwrap(), &hidden_states, &self.params.wk[layer], T::from(1.).unwrap());
+            OP::matmul_transb(v, T::from(0.).unwrap(), &hidden_states, &self.params.wv[layer], T::from(1.).unwrap());
             OP::rope(
                 q.reshape(&vec![seq_len, self.n_q_h, self.dqkv]),
                 past_seq_len,
@@ -117,9 +132,9 @@ impl Llama<f32> {
 
             // todo!("down_proj matmul and add residual");
             // residual = hidden_states @ wo.T + residual
-            OP::matmul_transb(&mut residual, 1., &hidden_states, &self.params.wo[layer], 1.);
+            OP::matmul_transb(&mut residual, T::from(1.).unwrap(), &hidden_states, &self.params.wo[layer], T::from(1.).unwrap());
             //todo!("mlp(...)");
-            hidden_states = Tensor::<f32>::default(&vec![seq_len, self.d]);
+            hidden_states = Tensor::<T>::default(&vec![seq_len, self.d]);
             mlp(
                 &mut residual,
                 &mut hidden_states,
@@ -130,12 +145,13 @@ impl Llama<f32> {
                 &self.params.w_gate[layer],
                 &self.params.rms_ffn_w[layer],
                 self.eps
-            )
+            );
+            //
         }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
         // which contains the probabilities for the next token.
-        let mut logits = Tensor::<f32>::default(&vec![1, self.vocab]);
+        let mut logits = Tensor::<T>::default(&vec![1, self.vocab]);
         let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &vec![1, self.d]);
         let residual = residual.slice((seq_len - 1) * self.d, &vec![self.d]);
 
@@ -146,7 +162,7 @@ impl Llama<f32> {
             self.eps,
         );
 
-        OP::matmul_transb(&mut logits, 0., &hidden_states, &self.params.lm_head, 1.0);
+        OP::matmul_transb(&mut logits, T::from(0.).unwrap(), &hidden_states, &self.params.lm_head, T::from(1.).unwrap());
 
         logits
     }
@@ -160,27 +176,28 @@ impl Llama<f32> {
         top_k: u32,
         temperature: f32,
     ) -> Vec<u32>{
-        let mut result = Vec::<u32>::new();
+        let mut result: Vec<u32> = Vec::<u32>::new();
         
         // todo!("实现文本生成");
         // step 1
         // initialize kvcache
-        let mut cache = self.new_cache();
+        let mut cache: KVCache<T> = self.new_cache();
         // push token_ids into result
         for token in token_ids{
             result.push(*token);
         }
-        let mut input_tensor = Tensor::new(token_ids.to_vec(), &vec![1,token_ids.len()]);
+        let mut input_tensor: Tensor<u32> = Tensor::new_usize(token_ids.to_vec(), &vec![1,token_ids.len()]);
         
         // random_sample and push into result
-        for _ in 0..max_len{
-            let forward_tensor = self.forward(&input_tensor, &mut cache);
+        for i in 0..max_len{
+            let forward_tensor: Tensor<T> = self.forward(&input_tensor, &mut cache);
+            //if i == 0 {forward_tensor.print();}
             let id = OP::random_sample(&forward_tensor, top_p, top_k, temperature);
             if id == self.eos_token_id {
                 break;
             }
             result.push(id);
-            input_tensor = Tensor::new(vec![id],&vec![1, 1]);
+            input_tensor = Tensor::new_usize(vec![id],&vec![1, 1]);
         }
         result
     }
@@ -193,22 +210,22 @@ impl Llama<f32> {
         top_p: f32,
         top_k: u32,
         temperature: f32,
-        mut cache: KVCache<f32>,
-    ) -> (Vec<u32>, KVCache<f32>){
+        mut cache: KVCache<T>,
+    ) -> (Vec<u32>, KVCache<T>){
         let length = token_ids.len();
         let mut result = Vec::<u32>::new();
         let token: Vec<u32> = Vec::from(token_ids);
         for token in token_ids{
             result.push(*token);
         }
-        let mut input = Tensor::<u32>::new(token, &vec![1, token_ids.len()]);
+        let mut input = Tensor::<u32>::new_usize(token, &vec![1, token_ids.len()]);
         loop {
             let output = OP::random_sample(&self.forward(&input, &mut cache), top_p, top_k, temperature);
             result.push(output);
             if result.len() >= max_len || output == self.eos_token_id {
                 break;
             }
-            input = Tensor::<u32>::new(Vec::from([output]), &vec![1, 1]);
+            input = Tensor::<u32>::new_usize(Vec::from([output]), &vec![1, 1]);
         }
         result = result[length..].to_vec();
         (result, cache)
@@ -219,20 +236,22 @@ impl Llama<f32> {
 
 
 
-fn self_attention(
-    hidden_states: &mut Tensor<f32>, // (seq, n_kv_h * n_groups * dqkv)
-    att_scores: &mut Tensor<f32>,    // (n_kv_h, n_groups, seq, total_seq)
-    q: &Tensor<f32>,                 // (seq, n_kv_h * n_groups * dqkv)
-    k: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
-    v: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
+fn self_attention<T>(
+    hidden_states: &mut Tensor<T>, // (seq, n_kv_h * n_groups * dqkv)
+    att_scores: &mut Tensor<T>,    // (n_kv_h, n_groups, seq, total_seq)
+    q: &Tensor<T>,                 // (seq, n_kv_h * n_groups * dqkv)
+    k: &Tensor<T>,                 // (total_seq, n_kv_h * dqkv)
+    v: &Tensor<T>,                 // (total_seq, n_kv_h * dqkv)
     n_kv_h: usize,
     n_groups: usize,
     seq_len: usize,
     total_seq_len: usize,
     dqkv: usize,
-) {
+)
+    where T: Float + Default + FromPrimitive + std::iter::Sum 
+{
     // step 1 ,socre = Q @ K.T / sqrt(dim) 
-    let sqrt_dim = (dqkv as f32).sqrt();
+    let sqrt_dim = T::from(dqkv).unwrap().sqrt();
     let scores = unsafe{att_scores.data_mut()};
     for i in 0..seq_len{
         for j in 0..total_seq_len{
@@ -241,7 +260,7 @@ fn self_attention(
                     let q_start = (m * n_groups + n) * dqkv + i * n_groups * n_kv_h * dqkv;
                     let q_= q.slice(q_start, &vec![dqkv, 1]);
                     let k_start = m * dqkv + j *  n_kv_h * dqkv;
-                    let k_: Tensor<f32> = k.slice(k_start, &vec![dqkv, 1]);
+                    let k_: Tensor<T> = k.slice(k_start, &vec![dqkv, 1]);
                     let value = OP::dot(&q_, &k_) / sqrt_dim;
                     scores[m * n_groups * seq_len * total_seq_len 
                         + n * seq_len * total_seq_len 
@@ -270,7 +289,7 @@ fn self_attention(
             let attn_start = (i * n_groups + j) * seq_len * total_seq_len;
             let attn_slice = &att_scores.slice(attn_start, &vec![seq_len, total_seq_len]);
             // reverse v
-            let mut v_rev = vec![0.; dqkv * total_seq_len];
+            let mut v_rev = vec![T::from(0.).unwrap(); dqkv * total_seq_len];
             for m in 0..dqkv{
                 for n in 0..total_seq_len{
                     v_rev[m * total_seq_len + n] = v_data[n * dqkv * n_kv_h + i * dqkv + m];
@@ -279,7 +298,7 @@ fn self_attention(
             let v_rev_tensor = Tensor::new(v_rev, &vec![dqkv, total_seq_len]);
             // matmul_transb result
             let mut mat_result = Tensor::default(&vec![seq_len, dqkv]);
-            OP::matmul_transb(&mut mat_result, 0., &attn_slice, &v_rev_tensor, 1.);
+            OP::matmul_transb(&mut mat_result, T::from(0.).unwrap(), &attn_slice, &v_rev_tensor, T::from(1.).unwrap());
             // hidden_state
             let mat_data = mat_result.data();
             for row in 0..seq_len{
@@ -293,22 +312,24 @@ fn self_attention(
 
 }
 
-fn mlp(
-    residual: &mut Tensor<f32>,
-    hidden_states: &mut Tensor<f32>,
-    gate: &mut Tensor<f32>,
-    up: &mut Tensor<f32>,
-    w_up: &Tensor<f32>,
-    w_down: &Tensor<f32>,
-    w_gate: &Tensor<f32>,
-    rms_w: &Tensor<f32>,
-    eps: f32,
-) {
+fn mlp<T>(
+    residual: &mut Tensor<T>,
+    hidden_states: &mut Tensor<T>,
+    gate: &mut Tensor<T>,
+    up: &mut Tensor<T>,
+    w_up: &Tensor<T>,
+    w_down: &Tensor<T>,
+    w_gate: &Tensor<T>,
+    rms_w: &Tensor<T>,
+    eps: impl Float,
+)
+    where T: Float + Default + std::iter::Sum + FromPrimitive + std::ops::MulAssign
+{
     OP::rms_norm(hidden_states,residual,rms_w,eps);
-    OP::matmul_transb(gate,0.0,hidden_states,w_gate,1.0);
-    OP::matmul_transb(up,0.0,hidden_states,w_up,1.0);
+    OP::matmul_transb(gate,T::from(0.).unwrap(),hidden_states,w_gate,T::from(1.).unwrap());
+    OP::matmul_transb(up,T::from(0.).unwrap(),hidden_states,w_up,T::from(1.).unwrap());
     OP::silu(up,gate);
-    OP::matmul_transb(residual,1.0,up,w_down,1.0);
+    OP::matmul_transb(residual,T::from(0.).unwrap(),up,w_down,T::from(1.).unwrap());
 }
 
 #[test]
@@ -355,7 +376,7 @@ pub fn test_load_safetensors() {
     use crate::tensor::float_eq;
     let project_dir = env!("CARGO_MANIFEST_DIR");
     let model_dir = PathBuf::from(project_dir).join("models").join("story");
-    let model = Llama::from_safetensors(model_dir);
+    let model = Llama::<f32>::from_safetensors(model_dir);
     assert_eq!(model.vocab, 2048);
     assert_eq!(model.n_layers, 2);
     assert_eq!(model.n_q_h, 8);
@@ -393,6 +414,6 @@ use tokenizers::Tokenizer;
     let input_ids = binding.get_ids();
     print!("\n{}", input);
     let mut cache = llama.new_cache();
-    let input_tensor = Tensor::new(input_ids.to_vec(), &vec![1,input_ids.len()]);
+    let input_tensor = Tensor::new_usize(input_ids.to_vec(), &vec![1,input_ids.len()]);
     llama.forward(&input_tensor, &mut cache).print();
 }
