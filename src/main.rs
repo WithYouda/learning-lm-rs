@@ -8,9 +8,6 @@ mod tensor;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
-use tch::kind;
-
-
 #[allow(unused)]
 fn story(
     max_len: usize,
