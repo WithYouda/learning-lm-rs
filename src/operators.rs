@@ -35,7 +35,7 @@ pub fn rope<T>(y: &mut Tensor<T>, start_pos: usize, theta: impl Float)
             for i in 0..d / 2 {
                 let a = data[tok * n_heads * d + head * d + i];
                 let b = data[tok * n_heads * d + head * d + i + d / 2];
-                let freq = T::from(pos).unwrap()  / T::from(theta).unwrap().powf(T::from((i * 2) / d ).unwrap());
+                let freq = T::from(pos).unwrap()  / T::from(theta).unwrap().powf(T::from(i * 2).unwrap() / T::from(d).unwrap());
                 let (sin, cos) = freq.sin_cos();
                 data[tok * n_heads * d + head * d + i] = a * cos - b * sin;
                 data[tok * n_heads * d + head * d + i + d / 2] = b * cos + a * sin;

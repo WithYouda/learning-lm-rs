@@ -45,9 +45,9 @@ impl GetTensorFromSafeTensors<f32> for f32 {
                 data_from_bytes!(tensor_view.data(), f32).collect(),
                 &tensor_view.shape().to_vec(),
             ),
-            safetensors::Dtype::F16 => {
-                let data = data_from_bytes!(tensor_view.data(), f16)
-                    .map(f16::to_f32)
+            safetensors::Dtype::BF16 => {
+                let data = data_from_bytes!(tensor_view.data(), half::bf16)
+                    .map(half::bf16::to_f32)
                     .collect();
                 Tensor::new(data, &tensor_view.shape().to_vec())
             }
@@ -56,15 +56,34 @@ impl GetTensorFromSafeTensors<f32> for f32 {
         Ok(tensor)
     }
 }
-impl GetTensorFromSafeTensors<f16> for f16 {
-    fn get_tensor_from(tensors: &SafeTensors, name: &str) -> Result<Tensor<f16>, &'static str> {
+impl GetTensorFromSafeTensors<half::bf16> for half::bf16 {
+    fn get_tensor_from(tensors: &SafeTensors, name: &str) -> Result<Tensor<half::bf16>, &'static str> {
         let tensor_view = tensors.tensor(name).map_err(|e| {
             assert!(matches!(e, safetensors::SafeTensorError::TensorNotFound(_)));
             "Tensor not found"
         })?;
+        
+        let tensor = match tensor_view.dtype() {
+            safetensors::Dtype::BF16 => {
+                let data = data_from_bytes!(tensor_view.data(), half::bf16).collect();
+                Tensor::new(data, &tensor_view.shape().to_vec())
+            }
+            _ => unimplemented!(),
+        };
+        Ok(tensor)
+    }
+}
+
+impl GetTensorFromSafeTensors<half::f16> for half::f16 {
+    fn get_tensor_from(tensors: &SafeTensors, name: &str) -> Result<Tensor<half::f16>, &'static str> {
+        let tensor_view = tensors.tensor(name).map_err(|e| {
+            assert!(matches!(e, safetensors::SafeTensorError::TensorNotFound(_)));
+            "Tensor not found"
+        })?;
+        
         let tensor = match tensor_view.dtype() {
             safetensors::Dtype::F16 => {
-                let data = data_from_bytes!(tensor_view.data(), f16).collect();
+                let data = data_from_bytes!(tensor_view.data(), half::f16).collect();
                 Tensor::new(data, &tensor_view.shape().to_vec())
             }
             _ => unimplemented!(),
@@ -106,7 +125,11 @@ macro_rules! impl_from_safetensors_for_LlamaParams {
                     w_gate: get_tensor_vec!("model.layers.{}.mlp.gate_proj.weight"),
                     w_down: get_tensor_vec!("model.layers.{}.mlp.down_proj.weight"),
 
-                    lm_head: <$Param>::get_tensor_from(tensors, "lm_head.weight").unwrap(),
+                    lm_head: if config.tie_word_embeddings{
+                        <$Param>::get_tensor_from(tensors, "lm_head.weight").unwrap()
+                    }else{
+                        <$Param>::get_tensor_from(tensors, "model.embed_tokens.weight").unwrap()
+                    },
                     rms_out_w: <$Param>::get_tensor_from(tensors, "model.norm.weight").unwrap(),
                 }
             }
@@ -115,3 +138,4 @@ macro_rules! impl_from_safetensors_for_LlamaParams {
 }
 impl_from_safetensors_for_LlamaParams!(f32);
 impl_from_safetensors_for_LlamaParams!(half::f16);
+impl_from_safetensors_for_LlamaParams!(half::bf16);

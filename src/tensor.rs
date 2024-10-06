@@ -113,6 +113,6 @@ pub fn float_eq<T: Float>(x: &T, y: &T, rel: T) -> bool
 where
     T: Float + FromPrimitive
 {
-    let two = T::from_f64(2.0).unwrap();
+    let two = T::from(2.0).unwrap();
     (*x - *y).abs() <= rel * (x.abs() + y.abs()) / two
 }

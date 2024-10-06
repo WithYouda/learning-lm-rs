@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 model_directory = "models/story"
@@ -17,9 +18,12 @@ def hook_fn(layer_name):
         }
     return hook
         
-for name, layer in model.named_modules():
-    print(f"layer name: {name}")
+#for name, layer in model.named_modules():
+    #print(f"layer name: {name}")
 
+
+for name, param in model.named_parameters():
+    print(name)
 
 for name, layer in model.named_modules():
     layer_name = f"transformer_layer_{name}"
@@ -28,14 +32,9 @@ for name, layer in model.named_modules():
 with torch.no_grad():
     model(**inputs)
 
-#x_r = torch.tensor(
-    
-    
-    
-#)
 
 x = outputs_dict['transformer_layer_lm_head']['output'][0]
 
 #print(x - x_r > 100)
-print(x)
+#print(x)
 

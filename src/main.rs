@@ -16,8 +16,8 @@ fn story(
     temperature: f32
 ){
     let project_dir = env!("CARGO_MANIFEST_DIR");
-    let model_dir = PathBuf::from(project_dir).join("models").join("story");
-    let llama = model::Llama::<f32>::from_safetensors(&model_dir);
+    let model_dir = PathBuf::from(project_dir).join("models").join("half").join("story");
+    let llama = model::Llama::<half::bf16>::from_safetensors(&model_dir);
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
     let input = "Once upon a time";
     let binding = tokenizer.encode(input, true).unwrap();
@@ -41,11 +41,11 @@ fn chats(
     temperature: f32
 ){
     let project_dir = env!("CARGO_MANIFEST_DIR");
-    let model_dir = PathBuf::from(project_dir).join("models").join("chat");
-    let llama = model::Llama::<f32>::from_safetensors(&model_dir);
+    let model_dir = PathBuf::from(project_dir).join("models").join("half").join("chat");
+    let llama = model::Llama::<half::f16>::from_safetensors(&model_dir);
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
-    let mut cache: kvcache::KVCache<f32> = llama.new_cache();
-    let mut user;
+    let mut cache = llama.new_cache();
+    let mut user: String;
     let mut input: String;
     let mut output_ids;
     println!("chat start!\n-----------------------------------------------------------------------------");
@@ -70,16 +70,17 @@ fn chats(
 }
 
 fn main() {
-    /*chats(
-        100,
-        5.,
-        10,
-        1.
-    );*/
-    story(
-        100,
+    chats(
+        50,
         5.,
         10,
         1.
     );
+    /*story(
+        200,
+        40.,
+        1,
+        0.6
+    );
+    */
 }

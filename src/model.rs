@@ -36,11 +36,10 @@ macro_rules! impl_from_safetensors_for_Llama {
             pub fn from_safetensors(model_dir: impl AsRef<Path>) -> Self {
                 let config = File::open(model_dir.as_ref().join("config.json")).unwrap();
                 let config: LlamaConfigJson = serde_json::from_reader(config).unwrap();
-                let model_file =
-                    std::fs::read(model_dir.as_ref().join("model.safetensors")).unwrap();
+                let model_file = std::fs::read(model_dir.as_ref().join("model.safetensors")).unwrap();
                 let safetensor = SafeTensors::deserialize(&model_file).unwrap();
 
-                assert!(config.num_attention_heads % config.num_key_value_heads == 0);
+                //assert!(config.num_attention_heads % config.num_key_value_heads == 0);
                 Self {
                     vocab: config.vocab_size,
                     n_layers: config.num_hidden_layers,
@@ -62,6 +61,7 @@ macro_rules! impl_from_safetensors_for_Llama {
 }
 
 impl_from_safetensors_for_Llama!(f32);
+impl_from_safetensors_for_Llama!(half::bf16);
 impl_from_safetensors_for_Llama!(half::f16);
 
 impl <T: Float + Default + std::iter::Sum + num_traits::FromPrimitive + std::fmt::Debug + std::ops::MulAssign>Llama<T> {
@@ -258,7 +258,7 @@ fn self_attention<T>(
             for m in 0..n_kv_h{
                 for n in 0..n_groups{
                     let q_start = (m * n_groups + n) * dqkv + i * n_groups * n_kv_h * dqkv;
-                    let q_= q.slice(q_start, &vec![dqkv, 1]);
+                    let q_: Tensor<T>= q.slice(q_start, &vec![dqkv, 1]);
                     let k_start = m * dqkv + j *  n_kv_h * dqkv;
                     let k_: Tensor<T> = k.slice(k_start, &vec![dqkv, 1]);
                     let value = OP::dot(&q_, &k_) / sqrt_dim;
@@ -329,7 +329,7 @@ fn mlp<T>(
     OP::matmul_transb(gate,T::from(0.).unwrap(),hidden_states,w_gate,T::from(1.).unwrap());
     OP::matmul_transb(up,T::from(0.).unwrap(),hidden_states,w_up,T::from(1.).unwrap());
     OP::silu(up,gate);
-    OP::matmul_transb(residual,T::from(0.).unwrap(),up,w_down,T::from(1.).unwrap());
+    OP::matmul_transb(residual,T::from(1.).unwrap(),up,w_down,T::from(1.).unwrap());
 }
 
 #[test]
