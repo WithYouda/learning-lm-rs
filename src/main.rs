@@ -1,9 +1,12 @@
- mod config;
+mod config;
+mod error;
 mod kvcache;
 mod model;
 mod operators;
 mod params;
+mod sampling;
 mod tensor;
+
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
