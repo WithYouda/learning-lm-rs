@@ -1,10 +1,9 @@
-mod config;
+ mod config;
 mod kvcache;
 mod model;
 mod operators;
 mod params;
 mod tensor;
-
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
@@ -12,7 +11,7 @@ use tokenizers::Tokenizer;
 fn story(
     max_len: usize,
     top_p: f32,
-    top_k: u32,
+    top_k: u32, 
     temperature: f32
 ){
     let project_dir = env!("CARGO_MANIFEST_DIR");
@@ -40,7 +39,8 @@ fn chats(
     temperature: f32
 ){
     let project_dir = env!("CARGO_MANIFEST_DIR");
-    let model_dir = PathBuf::from(project_dir).join("models").join("chat");
+    println!("{}",project_dir);
+    let model_dir = PathBuf::from(project_dir).join("models").join("story");
     let llama = model::Llama::<f32>::from_safetensors(&model_dir);
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
     let mut cache = llama.new_cache();
