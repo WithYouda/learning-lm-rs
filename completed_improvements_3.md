@@ -1766,3 +1766,48 @@
 
 - 第一阶段可继续沿“上游 CPU 路径对齐”推进：优先盯 `Q4_K/Q6_K` prefill 主路径与权重布局复用，而不是再增加解析层面复杂度。
 - 若要逼近你目标中的 `130+/35+` 口径，需要再补一条“无绑核 + 最大线程”的对照配置链路，与当前默认稳定口径并行保留。
+
+---
+
+## 第六轮优化（2026-03-13 会话 B）
+
+### 本轮目标
+根据 llama.cpp 代码规划并执行达到 80% 性能的全部阶段优化。
+
+### 已完成优化
+
+#### 阶段一：QuantQ8KBlockX4 非交错布局 + Q4K/Q6K x4 AVX2 微内核
+- **重构 x4 布局**：将 `QuantQ8KBlockX4.qs` 从交错排列改为行主序拼接，每行 256 字节连续，SIMD 可直接加载 32 字节对齐块。
+- **Q4K x4 AVX2 内核** (`q4k_accumulate_block_dot_q8k_x4_avx2`)：对每个 sub-block 一次性加载 Q4K 权重，对 4 行激活分别做 `_mm256_maddubs_epi16` + `_mm256_madd_epi16` + 水平归约。
+- **Q4K x4 meta AVX2 内核** (`q4k_accumulate_block_dot_q8k_x4_meta_avx2`)：预解析 K 元数据路径的 AVX2 加速。
+- **Q6K x4 AVX2 内核** (`q6k_accumulate_block_dot_q8k_x4_avx2`)：6-bit 权重拆解 + `split_hsum_i32_lo_hi_avx2` 分低/高 16 字节归约。
+- **Q6K x4 meta AVX2 内核**：同上的 meta 变体。
+- **prefill x4 微内核并行化**：对权重行维度 (n) 使用 `rayon::par_iter` 并行化。
+
+#### 阶段二：decode 路径优化
+- **FMA f32 向量点积** (`dot_f32_avx2_fma`)：`_mm256_fmadd_ps` + 双累加器。
+- **AVX2 激活量化** (`quantize_activation_block_q8k_avx2`)：SIMD max 查找 + 量化。
+- **软件预取**：decode matmul 主循环 `_mm_prefetch` 减少 L2 cache miss。
+
+#### 阶段三：算子级 SIMD 优化
+- **FMA sum_squares** (`sum_squares_f32_avx2_fma`)：双累加器 fmadd。
+- **AVX2 RMS norm apply** (`rms_norm_apply_f32_avx2`)：内循环向量化。
+
+#### 阶段四：关键 prefill 路径修复
+- **m%4 不整除修复**：之前 m%4!=0 时 x4 微内核完全跳过，修复后拆分为对齐部分（x4 AVX2）和尾部（单行回退）。
+
+### 修改的文件
+- `src/core/operators/quant/generic.rs`：新增 6 个 AVX2 内核 + 布局重构 + m%4 修复
+- `src/core/operators/operator.rs`：新增 FMA sum_squares + AVX2 RMS norm
+
+### 测试结果
+- `cargo test --release`：49 通过，2 预存在失败，4 忽略
+
+### 性能预估
+- **Prefill**：x4 AVX2 + 并行 + m%4 修复，预期 3-4x 提升（~24% → ~72-96%）
+- **Decode**：FMA + 预取 + SIMD 算子，预期 1.3-1.5x 提升（~43% → ~56-65%）
+
+### 下一步目标
+- 在真实硬件上跑双基准测试验证实际性能比
+- 若 decode 未达 80%：权重布局优化、rayon 粒度调优、L2 cache tiling
+- 若 prefill 已达 80%：继续优化 decode 至目标
