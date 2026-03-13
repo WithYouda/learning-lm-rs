@@ -123,22 +123,60 @@ fn rope_inv_freqs_cached(
     built
 }
 
+/// RMS norm 的应用步骤 SIMD 化：y[i] = x[i] * w[i] * inv_rms
+#[inline]
+fn rms_norm_apply_f32_simd(y: &mut [f32], x: &[f32], w: &[f32], inv_rms: f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { rms_norm_apply_f32_avx2(y, x, w, inv_rms) };
+            return;
+        }
+    }
+    for i in 0..y.len() {
+        y[i] = x[i] * w[i] * inv_rms;
+    }
+}
+
+/// AVX2 加速的 RMS norm 应用：将 x*w*inv_rms 向量化。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rms_norm_apply_f32_avx2(y: &mut [f32], x: &[f32], w: &[f32], inv_rms: f32) {
+    use std::arch::x86_64::*;
+    let n = y.len();
+    let n8 = n / 8 * 8;
+    let v_inv_rms = _mm256_set1_ps(inv_rms);
+    let mut i = 0usize;
+    while i < n8 {
+        let vx = _mm256_loadu_ps(x.as_ptr().add(i));
+        let vw = _mm256_loadu_ps(w.as_ptr().add(i));
+        let prod = _mm256_mul_ps(_mm256_mul_ps(vx, vw), v_inv_rms);
+        _mm256_storeu_ps(y.as_mut_ptr().add(i), prod);
+        i += 8;
+    }
+    while i < n {
+        y[i] = x[i] * w[i] * inv_rms;
+        i += 1;
+    }
+}
+
 #[inline]
 fn sum_squares_f32_simd(x: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx512f") {
-            // SAFETY: 运行时已检测 avx512f。
             return unsafe { sum_squares_f32_avx512(x) };
         }
+        // FMA + AVX2: 使用 fmadd_ps 将 v*v+acc 合并为单条指令
+        if std::is_x86_feature_detected!("fma") && std::is_x86_feature_detected!("avx2") {
+            return unsafe { sum_squares_f32_avx2_fma(x) };
+        }
         if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: 运行时已检测 avx2。
             return unsafe { sum_squares_f32_avx2(x) };
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: 仅在 aarch64 目标上编译并调用。
         return unsafe { sum_squares_f32_neon(x) };
     }
 
@@ -189,6 +227,41 @@ unsafe fn sum_squares_f32_avx2(x: &[f32]) -> f32 {
     }
     let mut tmp = [0.0f32; 8];
     _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+    let mut s = tmp.iter().sum::<f32>();
+    while i < n {
+        s += x[i] * x[i];
+        i += 1;
+    }
+    s
+}
+
+/// FMA 加速的平方和：使用 _mm256_fmadd_ps(v, v, acc) 替代分离的 mul+add。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn sum_squares_f32_avx2_fma(x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mut i = 0usize;
+    let n = x.len();
+    let n8 = n / 8 * 8;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    // 双累加器减少数据依赖
+    while i + 16 <= n8 {
+        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
+        acc0 = _mm256_fmadd_ps(v0, v0, acc0);
+        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+        acc1 = _mm256_fmadd_ps(v1, v1, acc1);
+        i += 16;
+    }
+    while i < n8 {
+        let v = _mm256_loadu_ps(x.as_ptr().add(i));
+        acc0 = _mm256_fmadd_ps(v, v, acc0);
+        i += 8;
+    }
+    acc0 = _mm256_add_ps(acc0, acc1);
+    let mut tmp = [0.0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), acc0);
     let mut s = tmp.iter().sum::<f32>();
     while i < n {
         s += x[i] * x[i];
@@ -430,9 +503,8 @@ pub fn rms_norm<T>(y: &mut Tensor<T>, x: &Tensor<T>, w: &Tensor<T>, epsilon: imp
                 let sum_sq = sum_squares_f32_simd(x_row);
                 let inv_rms = 1.0f32 / (sum_sq * inv_hidden + eps).sqrt();
 
-                for i in 0..hidden_size {
-                    y_row[i] = x_row[i] * w_f32[i] * inv_rms;
-                }
+                // RMS norm 内循环：y[i] = x[i] * w[i] * inv_rms，使用 SIMD 加速
+                rms_norm_apply_f32_simd(y_row, x_row, w_f32, inv_rms);
             }
         }
         return;
