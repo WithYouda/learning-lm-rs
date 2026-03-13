@@ -178,18 +178,18 @@ fn dot_f32_simd(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx512f") {
-            // SAFETY: 运行时已检测 avx512f。
             return unsafe { dot_f32_avx512(a, b) };
         }
+        // FMA + AVX2: 使用 _mm256_fmadd_ps 将 mul+add 合并为单条指令
+        if std::is_x86_feature_detected!("fma") && std::is_x86_feature_detected!("avx2") {
+            return unsafe { dot_f32_avx2_fma(a, b) };
+        }
         if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: 运行时已检测 avx2。
             return unsafe { dot_f32_avx2(a, b) };
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // AArch64 默认支持 NEON。
-        // SAFETY: 仅在 aarch64 目标上编译并调用。
         return unsafe { dot_f32_neon(a, b) };
     }
 
@@ -249,6 +249,48 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
 
     let mut tmp = [0.0f32; 8];
     _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+    let mut s = tmp.iter().sum::<f32>();
+
+    while i < n {
+        s += a[i] * b[i];
+        i += 1;
+    }
+    s
+}
+
+/// FMA 加速的 f32 向量点积：使用 _mm256_fmadd_ps 将乘法和累加合并为单条指令，
+/// 减少指令数并提高吞吐量。对 hot matrix cache 路径特别有效。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot_f32_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mut i = 0usize;
+    let n = a.len().min(b.len());
+    let n8 = n / 8 * 8;
+    // 使用两个累加器减少指令依赖，提高流水线利用率
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+
+    while i + 16 <= n8 {
+        let va0 = _mm256_loadu_ps(a.as_ptr().add(i));
+        let vb0 = _mm256_loadu_ps(b.as_ptr().add(i));
+        acc0 = _mm256_fmadd_ps(va0, vb0, acc0);
+        let va1 = _mm256_loadu_ps(a.as_ptr().add(i + 8));
+        let vb1 = _mm256_loadu_ps(b.as_ptr().add(i + 8));
+        acc1 = _mm256_fmadd_ps(va1, vb1, acc1);
+        i += 16;
+    }
+    while i < n8 {
+        let va = _mm256_loadu_ps(a.as_ptr().add(i));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+        acc0 = _mm256_fmadd_ps(va, vb, acc0);
+        i += 8;
+    }
+
+    acc0 = _mm256_add_ps(acc0, acc1);
+    let mut tmp = [0.0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), acc0);
     let mut s = tmp.iter().sum::<f32>();
 
     while i < n {
@@ -606,9 +648,22 @@ fn pack_activation_panel_block_q8k_x4(
 }
 
 #[inline]
+/// 将 256 个 f32 激活值量化为 Q8K 块。
+/// 有 AVX2+FMA 时走 SIMD 路径，否则用标量回退。
 fn quantize_activation_block_q8k(x: &[f32]) -> QuantQ8KBlock {
     debug_assert!(x.len() == 256);
 
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            return unsafe { quantize_activation_block_q8k_avx2(x) };
+        }
+    }
+    quantize_activation_block_q8k_scalar(x)
+}
+
+/// Q8K 量化标量路径。
+fn quantize_activation_block_q8k_scalar(x: &[f32]) -> QuantQ8KBlock {
     let mut max = 0.0f32;
     let mut amax = 0.0f32;
     for &v in x {
@@ -628,8 +683,6 @@ fn quantize_activation_block_q8k(x: &[f32]) -> QuantQ8KBlock {
         return out;
     }
 
-    // 与 llama.cpp 的 `quantize_row_q8_K_ref` 保持同一符号约定：
-    // `d` 允许带符号，这样后续 `q4_K/q6_K × q8_K` 的公式可直接套用。
     let iscale = -127.0f32 / max;
     out.d = 1.0 / iscale;
     for (idx, &v) in x.iter().enumerate() {
@@ -637,6 +690,78 @@ fn quantize_activation_block_q8k(x: &[f32]) -> QuantQ8KBlock {
         let q = q.clamp(-127, 127) as i8;
         out.qs[idx] = q;
         out.bsums[idx / 16] += q as i16;
+    }
+    out
+}
+
+/// Q8K 量化 AVX2 加速路径：使用 SIMD 加速 max 查找和量化循环。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_activation_block_q8k_avx2(x: &[f32]) -> QuantQ8KBlock {
+    use std::arch::x86_64::*;
+
+    // 第一步：用 AVX2 找最大绝对值
+    let mut max_abs_vec = _mm256_setzero_ps();
+    let sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF_u32 as i32));
+    for i in (0..256).step_by(8) {
+        let v = _mm256_loadu_ps(x.as_ptr().add(i));
+        let abs_v = _mm256_and_ps(v, sign_mask);
+        max_abs_vec = _mm256_max_ps(max_abs_vec, abs_v);
+    }
+    // 水平归约最大值
+    let mut tmp = [0.0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), max_abs_vec);
+    let amax = tmp.iter().cloned().fold(0.0f32, f32::max);
+
+    let mut out = QuantQ8KBlock {
+        d: 0.0,
+        qs: [0; 256],
+        bsums: [0; 16],
+    };
+    if amax == 0.0 {
+        return out;
+    }
+
+    // 找到产生 amax 的原始值（带符号）
+    let mut max = 0.0f32;
+    for &v in x {
+        if v.abs() >= amax {
+            max = v;
+            break;
+        }
+    }
+
+    let iscale = -127.0f32 / max;
+    out.d = 1.0 / iscale;
+
+    // 第二步：用 AVX2 向量化量化循环
+    let vscale = _mm256_set1_ps(iscale);
+    let vmin = _mm256_set1_ps(-127.0);
+    let vmax = _mm256_set1_ps(127.0);
+
+    for blk16 in 0..16 {
+        let base = blk16 * 16;
+        let mut bsum = 0i16;
+
+        // 处理 16 个元素（2 组 × 8 个 AVX2 向量）
+        for sub in 0..2 {
+            let off = base + sub * 8;
+            let v = _mm256_loadu_ps(x.as_ptr().add(off));
+            let scaled = _mm256_mul_ps(v, vscale);
+            let rounded = _mm256_round_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            let clamped = _mm256_min_ps(_mm256_max_ps(rounded, vmin), vmax);
+            let ints = _mm256_cvtps_epi32(clamped);
+
+            // 提取 8 个 i32 并转为 i8
+            let mut vals = [0i32; 8];
+            _mm256_storeu_si256(vals.as_mut_ptr() as *mut __m256i, ints);
+            for j in 0..8 {
+                let q = vals[j] as i8;
+                out.qs[off + j] = q;
+                bsum += q as i16;
+            }
+        }
+        out.bsums[blk16] = bsum;
     }
     out
 }
@@ -4851,6 +4976,7 @@ where
                 *out = T::from(beta_f32 * old + alpha_f32 * sum).unwrap_or(T::zero());
             });
         } else {
+            // decode 路径：每个权重行的点积独立计算，par_iter 并行化
             c_row.par_iter_mut().enumerate().for_each(|(row_w, out)| {
                 let phys_row = wq.physical_row(row_w);
                 let row_base = phys_row * blocks_per_row * L::block_size();
@@ -4858,6 +4984,24 @@ where
                 for blk in 0..blocks_per_row {
                     let base = row_base + blk * L::block_size();
                     let block = &wq.raw[base..base + L::block_size()];
+
+                    // 软件预取：在处理当前块时预取下一个块的数据到 L1 缓存
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        if blk + 1 < blocks_per_row {
+                            let next_base = row_base + (blk + 1) * L::block_size();
+                            unsafe {
+                                use std::arch::x86_64::*;
+                                let ptr = wq.raw.as_ptr().add(next_base);
+                                _mm_prefetch(ptr as *const i8, _MM_HINT_T0);
+                                // 对大块（>64字节）再预取后半部分
+                                if L::block_size() > 64 {
+                                    _mm_prefetch(ptr.add(64) as *const i8, _MM_HINT_T0);
+                                }
+                            }
+                        }
+                    }
+
                     if let Some(q8k_blocks) = q8k_blocks.as_ref() {
                         s += L::decode_block_dot_q8k(block, &q8k_blocks[blk]);
                         continue;
