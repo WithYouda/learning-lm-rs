@@ -111,7 +111,8 @@ impl PrefillQ8KKernelShape {
 
 #[inline]
 fn prefill_q8k_kernel_shape(n: usize, m: usize, traits: QuantTypeTraits) -> Option<PrefillQ8KKernelShape> {
-    if !traits.supports_prefill_q8k_x4 || traits.nrows == 0 || m < traits.nrows || m % traits.nrows != 0 {
+    // 允许 m 不被 nrows 整除：对齐部分走 x4 微内核，尾部走单行回退
+    if !traits.supports_prefill_q8k_x4 || traits.nrows == 0 || m < traits.nrows {
         return None;
     }
     Some(if traits.max_prefill_q8k_col_tile >= 8 && n >= 8 {
@@ -3996,29 +3997,62 @@ fn matmul_prefill_with_layout_q8k_interleaved<T, L: QuantLayout>(
     let blocks_per_row = k / L::qk();
     let block_tile = config.block_tile;
     let blocklen = shape.blocklen();
+    // m_aligned: 能被 4 整除的部分走 x4 微内核，m_rem: 尾部走单行 Q8K 回退
+    let m_aligned = (m / 4) * 4;
+    let m_rem = m - m_aligned;
     for block_start in (0..blocks_per_row).step_by(block_tile) {
         let block_cnt = (block_start + block_tile).min(blocks_per_row) - block_start;
-        let a_panel_q8k_x4 = pack_activation_panel_block_q8k_x4(
-            a_rows_f32,
-            m,
-            k,
-            block_start * L::qk(),
-            block_cnt,
-            blocklen,
-        );
-        apply_prefill_q8k_x4_microkernel::<T, L>(
-            c_data,
-            n,
-            m,
-            &a_panel_q8k_x4,
-            wq,
-            shape,
-            if block_start == 0 { beta_f32 } else { 1.0 },
-            alpha_f32,
-            blocks_per_row,
-            block_start,
-            block_cnt,
-        );
+
+        // 对齐部分：用 x4 微内核处理（AVX2 加速 + 权重行并行）
+        if m_aligned > 0 {
+            let a_panel_q8k_x4 = pack_activation_panel_block_q8k_x4(
+                a_rows_f32,
+                m_aligned,
+                k,
+                block_start * L::qk(),
+                block_cnt,
+                blocklen,
+            );
+            apply_prefill_q8k_x4_microkernel::<T, L>(
+                c_data,
+                n,
+                m_aligned,
+                &a_panel_q8k_x4,
+                wq,
+                shape,
+                if block_start == 0 { beta_f32 } else { 1.0 },
+                alpha_f32,
+                blocks_per_row,
+                block_start,
+                block_cnt,
+            );
+        }
+
+        // 尾部剩余行：用单行 Q8K 内核处理（仍然有 AVX2 加速）
+        if m_rem > 0 {
+            let rem_a_rows = &a_rows_f32[m_aligned * k..];
+            let rem_c_data = &mut c_data[m_aligned * n..];
+            let a_panel_q8k = pack_activation_panel_block_q8k(
+                rem_a_rows,
+                m_rem,
+                k,
+                block_start * L::qk(),
+                block_cnt,
+            );
+            apply_prefill_quant_panel_to_output_q8k::<T, L>(
+                rem_c_data,
+                n,
+                m_rem,
+                &a_panel_q8k,
+                wq,
+                if block_start == 0 { beta_f32 } else { 1.0 },
+                alpha_f32,
+                blocks_per_row,
+                block_start,
+                block_cnt,
+                config.row_tile,
+            );
+        }
     }
 }
 
@@ -4041,48 +4075,83 @@ fn matmul_prefill_batch2_with_layout_q8k_interleaved<T, L: QuantLayout>(
     let blocks_per_row = k / L::qk();
     let block_tile = config.block_tile;
     let blocklen = shape.blocklen();
+    let m_aligned = (m / 4) * 4;
+    let m_rem = m - m_aligned;
     for block_start in (0..blocks_per_row).step_by(block_tile) {
         let block_cnt = (block_start + block_tile).min(blocks_per_row) - block_start;
-        let a_panel_q8k_x4 = pack_activation_panel_block_q8k_x4(
-            a_rows_f32,
-            m,
-            k,
-            block_start * L::qk(),
-            block_cnt,
-            blocklen,
-        );
-        rayon::join(
-            || {
-                apply_prefill_q8k_x4_microkernel::<T, L>(
-                    c0_data,
-                    n,
-                    m,
-                    &a_panel_q8k_x4,
-                    wq0,
-                    shape,
-                    if block_start == 0 { beta_f32 } else { 1.0 },
-                    alpha_f32,
-                    blocks_per_row,
-                    block_start,
-                    block_cnt,
-                )
-            },
-            || {
-                apply_prefill_q8k_x4_microkernel::<T, L>(
-                    c1_data,
-                    n,
-                    m,
-                    &a_panel_q8k_x4,
-                    wq1,
-                    shape,
-                    if block_start == 0 { beta_f32 } else { 1.0 },
-                    alpha_f32,
-                    blocks_per_row,
-                    block_start,
-                    block_cnt,
-                )
-            },
-        );
+
+        // 对齐部分：x4 微内核 + 双权重矩阵并行
+        if m_aligned > 0 {
+            let a_panel_q8k_x4 = pack_activation_panel_block_q8k_x4(
+                a_rows_f32,
+                m_aligned,
+                k,
+                block_start * L::qk(),
+                block_cnt,
+                blocklen,
+            );
+            rayon::join(
+                || {
+                    apply_prefill_q8k_x4_microkernel::<T, L>(
+                        c0_data,
+                        n,
+                        m_aligned,
+                        &a_panel_q8k_x4,
+                        wq0,
+                        shape,
+                        if block_start == 0 { beta_f32 } else { 1.0 },
+                        alpha_f32,
+                        blocks_per_row,
+                        block_start,
+                        block_cnt,
+                    )
+                },
+                || {
+                    apply_prefill_q8k_x4_microkernel::<T, L>(
+                        c1_data,
+                        n,
+                        m_aligned,
+                        &a_panel_q8k_x4,
+                        wq1,
+                        shape,
+                        if block_start == 0 { beta_f32 } else { 1.0 },
+                        alpha_f32,
+                        blocks_per_row,
+                        block_start,
+                        block_cnt,
+                    )
+                },
+            );
+        }
+
+        // 尾部剩余行
+        if m_rem > 0 {
+            let rem_a_rows = &a_rows_f32[m_aligned * k..];
+            let rem_c0 = &mut c0_data[m_aligned * n..];
+            let rem_c1 = &mut c1_data[m_aligned * n..];
+            let a_panel_q8k = pack_activation_panel_block_q8k(
+                rem_a_rows,
+                m_rem,
+                k,
+                block_start * L::qk(),
+                block_cnt,
+            );
+            let b = if block_start == 0 { beta_f32 } else { 1.0 };
+            rayon::join(
+                || {
+                    apply_prefill_quant_panel_to_output_q8k::<T, L>(
+                        rem_c0, n, m_rem, &a_panel_q8k, wq0, b, alpha_f32,
+                        blocks_per_row, block_start, block_cnt, config.row_tile,
+                    );
+                },
+                || {
+                    apply_prefill_quant_panel_to_output_q8k::<T, L>(
+                        rem_c1, n, m_rem, &a_panel_q8k, wq1, b, alpha_f32,
+                        blocks_per_row, block_start, block_cnt, config.row_tile,
+                    );
+                },
+            );
+        }
     }
 }
 
