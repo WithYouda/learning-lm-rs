@@ -545,18 +545,22 @@ pub(crate) struct QuantQ8KBlockX4 {
     bsums: [i16; 64],
 }
 
+/// 从 x4 块中按行号和元素索引读取量化值。
+/// 采用非交错（行主序）布局：qs[row * 256 + idx]。
+/// 这样每行的 256 个值是连续的，便于 AVX2 向量化读取。
 #[inline]
 fn q8k_x4_q(a: &QuantQ8KBlockX4, row: usize, idx: usize) -> i8 {
-    // pack_q8k_block_x4 将每个逻辑 idx 的四行值连续交错写入：
-    // [row0(idx), row1(idx), row2(idx), row3(idx)]。
-    // 因此可直接按 idx*4 + row 读取，避免热路径中的除法与取模。
-    a.qs[idx * 4 + row]
+    a.qs[row * 256 + idx]
 }
 
+/// 将 4 个 QuantQ8KBlock 打包为一个 QuantQ8KBlockX4。
+/// 采用非交错（行主序拼接）布局：
+///   qs = [row0 的 256 字节 | row1 的 256 字节 | row2 的 256 字节 | row3 的 256 字节]
+/// 优点：每行数据连续存储，AVX2 可直接 loadu 256 位加载 32 字节，
+///       且可直接复用单行 AVX2 点积内核。
 #[inline]
-fn pack_q8k_block_x4(rows: &[QuantQ8KBlock], blocklen: usize) -> QuantQ8KBlockX4 {
+fn pack_q8k_block_x4(rows: &[QuantQ8KBlock], _blocklen: usize) -> QuantQ8KBlockX4 {
     debug_assert!(rows.len() == 4);
-    debug_assert!(blocklen == 1 || blocklen == 4 || blocklen == 8);
     let mut out = QuantQ8KBlockX4 {
         d: [0.0; 4],
         qs: [0; 1024],
@@ -564,19 +568,13 @@ fn pack_q8k_block_x4(rows: &[QuantQ8KBlock], blocklen: usize) -> QuantQ8KBlockX4
     };
     for row in 0..4 {
         out.d[row] = rows[row].d;
+        // bsums 按行拼接：[row0: 16][row1: 16][row2: 16][row3: 16]
         for i in 0..16 {
             out.bsums[row * 16 + i] = rows[row].bsums[i];
         }
-    }
-    let chunk_cnt = 256 / blocklen;
-    for chunk in 0..chunk_cnt {
-        let src_base = chunk * blocklen;
-        let dst_base = chunk * blocklen * 4;
-        for inner in 0..blocklen {
-            for row in 0..4 {
-                out.qs[dst_base + inner * 4 + row] = rows[row].qs[src_base + inner];
-            }
-        }
+        // qs 按行拼接：每行 256 字节连续
+        let dst_base = row * 256;
+        out.qs[dst_base..dst_base + 256].copy_from_slice(&rows[row].qs);
     }
     out
 }
@@ -1328,8 +1326,23 @@ fn q5k_accumulate_block_dot_q8k_x4(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f
     }
 }
 
+/// Q4K × Q8K x4 累加：对 4 行激活分别执行 Q4K 点积并累加到 out。
+/// 非交错布局下每行 256 字节连续，可直接复用单行 AVX2 内核。
 #[inline]
 fn q4k_accumulate_block_dot_q8k_x4(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f32; 4]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { q4k_accumulate_block_dot_q8k_x4_avx2(raw, a, out) };
+            return;
+        }
+    }
+    q4k_accumulate_block_dot_q8k_x4_scalar(raw, a, out);
+}
+
+/// Q4K × Q8K x4 标量回退路径（非交错布局）。
+#[inline]
+fn q4k_accumulate_block_dot_q8k_x4_scalar(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f32; 4]) {
     if a.d.iter().all(|&d| d == 0.0) {
         return;
     }
@@ -1376,8 +1389,96 @@ fn q4k_accumulate_block_dot_q8k_x4(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f
     }
 }
 
+/// Q4K × Q8K x4 AVX2 加速版。
+/// 非交错布局下，每行 qs 数据连续存储在 a.qs[row*256..(row+1)*256]，
+/// 可直接复用单行 AVX2 的 maddubs/madd 逻辑。
+/// 权重数据只解析一次，4 行激活分别执行 SIMD 点积。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q4k_accumulate_block_dot_q8k_x4_avx2(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f32; 4]) {
+    use std::arch::x86_64::*;
+
+    let d = half::f16::from_bits(read_u16_le(raw, 0)).to_f32();
+    let dmin = half::f16::from_bits(read_u16_le(raw, 2)).to_f32();
+    let scales = &raw[4..16];
+    let qs = &raw[16..144];
+
+    let low_mask = _mm256_set1_epi8(0x0f);
+    let ones_16 = _mm256_set1_epi16(1);
+
+    // 逐行处理：权重只加载一次，4 行激活分别做 SIMD 点积
+    for row in 0..4 {
+        if a.d[row] == 0.0 {
+            continue;
+        }
+        let a_qs_base = row * 256; // 非交错布局：每行 256 字节连续
+        let a_bsums_base = row * 16;
+        let mut sum = 0.0f32;
+        let mut is = 0usize;
+        let mut q_off = 0usize;
+        let mut a_off = 0usize;
+
+        for sub in 0..4 {
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+
+            // 加载 32 字节 Q4K 权重
+            let q_raw = _mm256_loadu_si256(qs.as_ptr().add(q_off) as *const __m256i);
+            let q_lo = _mm256_and_si256(q_raw, low_mask);
+            let q_hi = _mm256_and_si256(_mm256_srli_epi16(q_raw, 4), low_mask);
+
+            // 加载该行对应的 64 字节 Q8K 激活
+            let a_lo = _mm256_loadu_si256(a.qs.as_ptr().add(a_qs_base + a_off) as *const __m256i);
+            let a_hi = _mm256_loadu_si256(a.qs.as_ptr().add(a_qs_base + a_off + 32) as *const __m256i);
+
+            // maddubs + madd → i32 累加
+            let dot_lo = _mm256_madd_epi16(_mm256_maddubs_epi16(q_lo, a_lo), ones_16);
+            let dot_hi = _mm256_madd_epi16(_mm256_maddubs_epi16(q_hi, a_hi), ones_16);
+
+            let isum_lo = hsum_i32_avx2(dot_lo);
+            let isum_hi = hsum_i32_avx2(dot_hi);
+
+            let sum1 = a.bsums[a_bsums_base + sub * 4] as i32
+                + a.bsums[a_bsums_base + sub * 4 + 1] as i32;
+            let sum2 = a.bsums[a_bsums_base + sub * 4 + 2] as i32
+                + a.bsums[a_bsums_base + sub * 4 + 3] as i32;
+
+            sum += a.d[row]
+                * (d * sc1 as f32 * isum_lo as f32 - dmin * m1 as f32 * sum1 as f32)
+                + a.d[row]
+                    * (d * sc2 as f32 * isum_hi as f32 - dmin * m2 as f32 * sum2 as f32);
+
+            is += 2;
+            q_off += 32;
+            a_off += 64;
+        }
+        out[row] += sum;
+    }
+}
+
+/// Q4K × Q8K x4 累加 (meta 预提取版)：使用预解析的 d/dmin/scales/mins 元数据。
+/// 非交错布局下每行连续，有 AVX2 时走 SIMD 路径。
 #[inline]
 fn q4k_accumulate_block_dot_q8k_x4_meta(
+    raw: &[u8],
+    meta: &QuantQ4KPrefillMetadata,
+    linear_idx: usize,
+    a: &QuantQ8KBlockX4,
+    out: &mut [f32; 4],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { q4k_accumulate_block_dot_q8k_x4_meta_avx2(raw, meta, linear_idx, a, out) };
+            return;
+        }
+    }
+    q4k_accumulate_block_dot_q8k_x4_meta_scalar(raw, meta, linear_idx, a, out);
+}
+
+/// Q4K × Q8K x4 meta 标量回退路径。
+#[inline]
+fn q4k_accumulate_block_dot_q8k_x4_meta_scalar(
     raw: &[u8],
     meta: &QuantQ4KPrefillMetadata,
     linear_idx: usize,
@@ -1430,8 +1531,88 @@ fn q4k_accumulate_block_dot_q8k_x4_meta(
     }
 }
 
+/// Q4K × Q8K x4 meta AVX2 加速版。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q4k_accumulate_block_dot_q8k_x4_meta_avx2(
+    raw: &[u8],
+    meta: &QuantQ4KPrefillMetadata,
+    linear_idx: usize,
+    a: &QuantQ8KBlockX4,
+    out: &mut [f32; 4],
+) {
+    use std::arch::x86_64::*;
+
+    let qs = &raw[16..144];
+    let d = meta.d[linear_idx];
+    let dmin = meta.dmin[linear_idx];
+    let meta_off = linear_idx * 8;
+
+    let low_mask = _mm256_set1_epi8(0x0f);
+    let ones_16 = _mm256_set1_epi16(1);
+
+    for row in 0..4 {
+        if a.d[row] == 0.0 {
+            continue;
+        }
+        let a_qs_base = row * 256;
+        let a_bsums_base = row * 16;
+        let mut sum = 0.0f32;
+        let mut q_off = 0usize;
+        let mut a_off = 0usize;
+
+        for sub in 0..4 {
+            let sc1 = meta.scales[meta_off + sub * 2] as f32;
+            let m1 = meta.mins[meta_off + sub * 2] as f32;
+            let sc2 = meta.scales[meta_off + sub * 2 + 1] as f32;
+            let m2 = meta.mins[meta_off + sub * 2 + 1] as f32;
+
+            // 加载 32 字节 Q4K 权重
+            let q_raw = _mm256_loadu_si256(qs.as_ptr().add(q_off) as *const __m256i);
+            let q_lo = _mm256_and_si256(q_raw, low_mask);
+            let q_hi = _mm256_and_si256(_mm256_srli_epi16(q_raw, 4), low_mask);
+
+            let a_lo = _mm256_loadu_si256(a.qs.as_ptr().add(a_qs_base + a_off) as *const __m256i);
+            let a_hi = _mm256_loadu_si256(a.qs.as_ptr().add(a_qs_base + a_off + 32) as *const __m256i);
+
+            let dot_lo = _mm256_madd_epi16(_mm256_maddubs_epi16(q_lo, a_lo), ones_16);
+            let dot_hi = _mm256_madd_epi16(_mm256_maddubs_epi16(q_hi, a_hi), ones_16);
+
+            let isum_lo = hsum_i32_avx2(dot_lo);
+            let isum_hi = hsum_i32_avx2(dot_hi);
+
+            let sum1 = a.bsums[a_bsums_base + sub * 4] as i32
+                + a.bsums[a_bsums_base + sub * 4 + 1] as i32;
+            let sum2 = a.bsums[a_bsums_base + sub * 4 + 2] as i32
+                + a.bsums[a_bsums_base + sub * 4 + 3] as i32;
+
+            sum += a.d[row] * (d * sc1 * isum_lo as f32 - dmin * m1 * sum1 as f32)
+                + a.d[row] * (d * sc2 * isum_hi as f32 - dmin * m2 * sum2 as f32);
+
+            q_off += 32;
+            a_off += 64;
+        }
+        out[row] += sum;
+    }
+}
+
+/// Q6K × Q8K x4 累加：对 4 行激活分别执行 Q6K 点积并累加到 out。
+/// 非交错布局下每行 256 字节连续，可直接复用单行 AVX2 内核逻辑。
 #[inline]
 fn q6k_accumulate_block_dot_q8k_x4(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f32; 4]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { q6k_accumulate_block_dot_q8k_x4_avx2(raw, a, out) };
+            return;
+        }
+    }
+    q6k_accumulate_block_dot_q8k_x4_scalar(raw, a, out);
+}
+
+/// Q6K × Q8K x4 标量回退路径（非交错布局）。
+#[inline]
+fn q6k_accumulate_block_dot_q8k_x4_scalar(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f32; 4]) {
     if a.d.iter().all(|&d| d == 0.0) {
         return;
     }
@@ -1472,8 +1653,134 @@ fn q6k_accumulate_block_dot_q8k_x4(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f
     }
 }
 
+/// Q6K × Q8K x4 AVX2 加速版。
+/// 非交错布局下，每行 qs 数据连续存储在 a.qs[row*256..(row+1)*256]，
+/// 权重只解码一次，4 行激活分别执行 SIMD 点积。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q6k_accumulate_block_dot_q8k_x4_avx2(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f32; 4]) {
+    use std::arch::x86_64::*;
+
+    let ql_all = &raw[0..128];
+    let qh_all = &raw[128..192];
+    let sc_all = &raw[192..208];
+    let d = half::f16::from_bits(read_u16_le(raw, 208)).to_f32();
+
+    let low_mask = _mm256_set1_epi8(0x0f);
+    let m32 = _mm256_set1_epi8(32);
+
+    // 逐行处理：权重只解码一次，4 行激活分别 SIMD 点积
+    for row in 0..4 {
+        if a.d[row] == 0.0 {
+            continue;
+        }
+        let a_qs_base = row * 256;
+        let mut sum = 0.0f32;
+        let mut ql_off = 0usize;
+        let mut qh_off = 0usize;
+        let mut sc_off = 0usize;
+        let mut a_off = 0usize;
+
+        for _ in 0..2 {
+            // 加载 ql (64字节) 和 qh (32字节)
+            let ql_0 = _mm256_loadu_si256(ql_all.as_ptr().add(ql_off) as *const __m256i);
+            let ql_1 = _mm256_loadu_si256(ql_all.as_ptr().add(ql_off + 32) as *const __m256i);
+            let qh = _mm256_loadu_si256(qh_all.as_ptr().add(qh_off) as *const __m256i);
+
+            // 组合 6-bit 量化值
+            let q1 = _mm256_or_si256(
+                _mm256_and_si256(ql_0, low_mask),
+                _mm256_slli_epi16(_mm256_and_si256(qh, _mm256_set1_epi8(0x03)), 4),
+            );
+            let q2 = _mm256_or_si256(
+                _mm256_and_si256(ql_1, low_mask),
+                _mm256_slli_epi16(
+                    _mm256_and_si256(_mm256_srli_epi16(qh, 2), _mm256_set1_epi8(0x03)),
+                    4,
+                ),
+            );
+            let q3 = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(ql_0, 4), low_mask),
+                _mm256_slli_epi16(
+                    _mm256_and_si256(_mm256_srli_epi16(qh, 4), _mm256_set1_epi8(0x03)),
+                    4,
+                ),
+            );
+            let q4 = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(ql_1, 4), low_mask),
+                _mm256_slli_epi16(
+                    _mm256_and_si256(_mm256_srli_epi16(qh, 6), _mm256_set1_epi8(0x03)),
+                    4,
+                ),
+            );
+
+            // 减去偏移 32 得到有符号值
+            let q1s = _mm256_sub_epi8(q1, m32);
+            let q2s = _mm256_sub_epi8(q2, m32);
+            let q3s = _mm256_sub_epi8(q3, m32);
+            let q4s = _mm256_sub_epi8(q4, m32);
+
+            // 加载该行的 128 字节 Q8K 激活
+            let a1 = _mm256_loadu_si256(a.qs.as_ptr().add(a_qs_base + a_off) as *const __m256i);
+            let a2 = _mm256_loadu_si256(a.qs.as_ptr().add(a_qs_base + a_off + 32) as *const __m256i);
+            let a3 = _mm256_loadu_si256(a.qs.as_ptr().add(a_qs_base + a_off + 64) as *const __m256i);
+            let a4 = _mm256_loadu_si256(a.qs.as_ptr().add(a_qs_base + a_off + 96) as *const __m256i);
+
+            // scale 系数
+            let sc0 = sc_all[sc_off] as i8 as i32;
+            let sc1 = sc_all[sc_off + 1] as i8 as i32;
+            let sc2 = sc_all[sc_off + 2] as i8 as i32;
+            let sc3 = sc_all[sc_off + 3] as i8 as i32;
+            let sc4 = sc_all[sc_off + 4] as i8 as i32;
+            let sc5 = sc_all[sc_off + 5] as i8 as i32;
+            let sc6 = sc_all[sc_off + 6] as i8 as i32;
+            let sc7 = sc_all[sc_off + 7] as i8 as i32;
+
+            // 拆分低/高 16 字节的 SIMD 点积
+            let (dot1_lo, dot1_hi) = split_hsum_i32_lo_hi_avx2(q1s, a1);
+            let (dot2_lo, dot2_hi) = split_hsum_i32_lo_hi_avx2(q2s, a2);
+            let (dot3_lo, dot3_hi) = split_hsum_i32_lo_hi_avx2(q3s, a3);
+            let (dot4_lo, dot4_hi) = split_hsum_i32_lo_hi_avx2(q4s, a4);
+
+            let total = (dot1_lo * sc0 + dot1_hi * sc1)
+                + (dot2_lo * sc2 + dot2_hi * sc3)
+                + (dot3_lo * sc4 + dot3_hi * sc5)
+                + (dot4_lo * sc6 + dot4_hi * sc7);
+
+            sum += a.d[row] * d * total as f32;
+
+            ql_off += 64;
+            qh_off += 32;
+            sc_off += 8;
+            a_off += 128;
+        }
+        out[row] += sum;
+    }
+}
+
+/// Q6K × Q8K x4 累加 (meta 预提取版)：使用预解析的 d/scales 元数据。
+/// 非交错布局下每行连续，有 AVX2 时走 SIMD 路径。
 #[inline]
 fn q6k_accumulate_block_dot_q8k_x4_meta(
+    raw: &[u8],
+    meta: &QuantQ6KPrefillMetadata,
+    linear_idx: usize,
+    a: &QuantQ8KBlockX4,
+    out: &mut [f32; 4],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { q6k_accumulate_block_dot_q8k_x4_meta_avx2(raw, meta, linear_idx, a, out) };
+            return;
+        }
+    }
+    q6k_accumulate_block_dot_q8k_x4_meta_scalar(raw, meta, linear_idx, a, out);
+}
+
+/// Q6K × Q8K x4 meta 标量回退路径。
+#[inline]
+fn q6k_accumulate_block_dot_q8k_x4_meta_scalar(
     raw: &[u8],
     meta: &QuantQ6KPrefillMetadata,
     linear_idx: usize,
@@ -1517,6 +1824,108 @@ fn q6k_accumulate_block_dot_q8k_x4_meta(
         a_off += 128;
         ql = &ql[64..];
         qh = &qh[32..];
+    }
+}
+
+/// Q6K × Q8K x4 meta AVX2 加速版。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q6k_accumulate_block_dot_q8k_x4_meta_avx2(
+    raw: &[u8],
+    meta: &QuantQ6KPrefillMetadata,
+    linear_idx: usize,
+    a: &QuantQ8KBlockX4,
+    out: &mut [f32; 4],
+) {
+    use std::arch::x86_64::*;
+
+    let ql_all = &raw[0..128];
+    let qh_all = &raw[128..192];
+    let d = meta.d[linear_idx];
+    let scales = &meta.scales[linear_idx * 16..(linear_idx + 1) * 16];
+
+    let low_mask = _mm256_set1_epi8(0x0f);
+    let m32 = _mm256_set1_epi8(32);
+
+    for row in 0..4 {
+        if a.d[row] == 0.0 {
+            continue;
+        }
+        let a_qs_base = row * 256;
+        let mut sum = 0.0f32;
+        let mut ql_off = 0usize;
+        let mut qh_off = 0usize;
+        let mut a_off = 0usize;
+
+        for half in 0..2 {
+            let sc = &scales[half * 8..half * 8 + 8];
+
+            let ql_0 = _mm256_loadu_si256(ql_all.as_ptr().add(ql_off) as *const __m256i);
+            let ql_1 = _mm256_loadu_si256(ql_all.as_ptr().add(ql_off + 32) as *const __m256i);
+            let qh = _mm256_loadu_si256(qh_all.as_ptr().add(qh_off) as *const __m256i);
+
+            let q1 = _mm256_or_si256(
+                _mm256_and_si256(ql_0, low_mask),
+                _mm256_slli_epi16(_mm256_and_si256(qh, _mm256_set1_epi8(0x03)), 4),
+            );
+            let q2 = _mm256_or_si256(
+                _mm256_and_si256(ql_1, low_mask),
+                _mm256_slli_epi16(
+                    _mm256_and_si256(_mm256_srli_epi16(qh, 2), _mm256_set1_epi8(0x03)),
+                    4,
+                ),
+            );
+            let q3 = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(ql_0, 4), low_mask),
+                _mm256_slli_epi16(
+                    _mm256_and_si256(_mm256_srli_epi16(qh, 4), _mm256_set1_epi8(0x03)),
+                    4,
+                ),
+            );
+            let q4 = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(ql_1, 4), low_mask),
+                _mm256_slli_epi16(
+                    _mm256_and_si256(_mm256_srli_epi16(qh, 6), _mm256_set1_epi8(0x03)),
+                    4,
+                ),
+            );
+
+            let q1s = _mm256_sub_epi8(q1, m32);
+            let q2s = _mm256_sub_epi8(q2, m32);
+            let q3s = _mm256_sub_epi8(q3, m32);
+            let q4s = _mm256_sub_epi8(q4, m32);
+
+            let a1 = _mm256_loadu_si256(a.qs.as_ptr().add(a_qs_base + a_off) as *const __m256i);
+            let a2 = _mm256_loadu_si256(a.qs.as_ptr().add(a_qs_base + a_off + 32) as *const __m256i);
+            let a3 = _mm256_loadu_si256(a.qs.as_ptr().add(a_qs_base + a_off + 64) as *const __m256i);
+            let a4 = _mm256_loadu_si256(a.qs.as_ptr().add(a_qs_base + a_off + 96) as *const __m256i);
+
+            let sc0 = sc[0] as f32;
+            let sc1 = sc[1] as f32; // 注意：meta 里的 scale 是 f32，不是 i8
+            let sc2 = sc[2] as f32;
+            let sc3 = sc[3] as f32;
+            let sc4 = sc[4] as f32;
+            let sc5 = sc[5] as f32;
+            let sc6 = sc[6] as f32;
+            let sc7 = sc[7] as f32;
+
+            let (dot1_lo, dot1_hi) = split_hsum_i32_lo_hi_avx2(q1s, a1);
+            let (dot2_lo, dot2_hi) = split_hsum_i32_lo_hi_avx2(q2s, a2);
+            let (dot3_lo, dot3_hi) = split_hsum_i32_lo_hi_avx2(q3s, a3);
+            let (dot4_lo, dot4_hi) = split_hsum_i32_lo_hi_avx2(q4s, a4);
+
+            let total = (dot1_lo as f32 * sc0 + dot1_hi as f32 * sc1)
+                + (dot2_lo as f32 * sc2 + dot2_hi as f32 * sc3)
+                + (dot3_lo as f32 * sc4 + dot3_hi as f32 * sc5)
+                + (dot4_lo as f32 * sc6 + dot4_hi as f32 * sc7);
+
+            sum += a.d[row] * d * total;
+
+            ql_off += 64;
+            qh_off += 32;
+            a_off += 128;
+        }
+        out[row] += sum;
     }
 }
 
@@ -3350,6 +3759,9 @@ fn apply_prefill_quant_panel_to_output_q8k<T, L: QuantLayout>(
     }
 }
 
+/// x4 微内核：对 m/4 组激活行（每组 4 行）× n 权重行执行量化矩阵乘法。
+/// 核心优化：对权重行维度 (n) 使用 rayon 并行化，避免之前完全串行的性能瓶颈。
+/// 配合 AVX2 加速的 x4 累加内核，大幅提升 prefill 吞吐。
 fn apply_prefill_q8k_x4_microkernel<T, L: QuantLayout>(
     c_data: &mut [T],
     n: usize,
@@ -3367,21 +3779,24 @@ fn apply_prefill_q8k_x4_microkernel<T, L: QuantLayout>(
 {
     debug_assert!(m % 4 == 0);
     let row_groups = m / 4;
-    let col_tile = shape.col_tile();
+    let _col_tile = shape.col_tile();
     let packed_layout = wq.prefill_packed.as_deref();
     let legacy_interleave = wq.prefill_q8k_interleave.as_deref();
     let k_metadata = packed_layout
         .and_then(|layout| layout.metadata())
         .or_else(|| wq.prefill_k_metadata.as_deref());
+
     for row_group in 0..row_groups {
         let row_base = row_group * 4;
-        for col_start in (0..n).step_by(col_tile) {
-            let col_cnt = (col_start + col_tile).min(n) - col_start;
-            let mut sums = [[0.0f32; 8]; 4];
-            for blk in 0..block_cnt {
-                let a_blk = &a_panel_q8k_x4[row_group * block_cnt + blk];
-                for col in 0..col_cnt {
-                    let logical_row = col_start + col;
+        let a_base = row_group * block_cnt;
+
+        // 对权重行维度 (n) 并行化：每个线程独立计算一批权重行的 4 路点积
+        let results: Vec<[f32; 4]> = (0..n)
+            .into_par_iter()
+            .map(|logical_row| {
+                let mut sums = [0.0f32; 4];
+                for blk in 0..block_cnt {
+                    let a_blk = &a_panel_q8k_x4[a_base + blk];
                     let block = if let Some(layout) = packed_layout {
                         layout.block(block_start + blk, logical_row).unwrap_or_else(|| {
                             panic!(
@@ -3400,33 +3815,40 @@ fn apply_prefill_q8k_x4_microkernel<T, L: QuantLayout>(
                         })
                     } else {
                         let phys_row = wq.physical_row(logical_row);
-                        let base = (phys_row * blocks_per_row + block_start + blk) * L::block_size();
+                        let base =
+                            (phys_row * blocks_per_row + block_start + blk) * L::block_size();
                         &wq.raw[base..base + L::block_size()]
                     };
-                    let mut tmp = [0.0f32; 4];
                     let linear_idx = logical_row * blocks_per_row + block_start + blk;
                     match k_metadata {
-                        Some(QuantPrefillKMetadata::Q4K(meta)) if wq.tensor_type == GGMLType::Q4K => {
-                            q4k_accumulate_block_dot_q8k_x4_meta(block, meta, linear_idx, a_blk, &mut tmp)
+                        Some(QuantPrefillKMetadata::Q4K(meta))
+                            if wq.tensor_type == GGMLType::Q4K =>
+                        {
+                            q4k_accumulate_block_dot_q8k_x4_meta(
+                                block, meta, linear_idx, a_blk, &mut sums,
+                            )
                         }
-                        Some(QuantPrefillKMetadata::Q6K(meta)) if wq.tensor_type == GGMLType::Q6K => {
-                            q6k_accumulate_block_dot_q8k_x4_meta(block, meta, linear_idx, a_blk, &mut tmp)
+                        Some(QuantPrefillKMetadata::Q6K(meta))
+                            if wq.tensor_type == GGMLType::Q6K =>
+                        {
+                            q6k_accumulate_block_dot_q8k_x4_meta(
+                                block, meta, linear_idx, a_blk, &mut sums,
+                            )
                         }
-                        _ => L::accumulate_block_dot_q8k_x4(block, a_blk, &mut tmp),
-                    }
-                    for row in 0..4 {
-                        sums[row][col] += tmp[row];
+                        _ => L::accumulate_block_dot_q8k_x4(block, a_blk, &mut sums),
                     }
                 }
-            }
+                sums
+            })
+            .collect();
 
+        // 将并行计算的结果写回输出矩阵
+        for (col, sums) in results.iter().enumerate() {
             for row in 0..4 {
-                let c_row = &mut c_data[(row_base + row) * n..(row_base + row + 1) * n];
-                for col in 0..col_cnt {
-                    let old = c_row[col_start + col].to_f32().unwrap_or(0.0);
-                    c_row[col_start + col] = T::from(beta_f32 * old + alpha_f32 * sums[row][col])
-                        .unwrap_or(T::zero());
-                }
+                let idx = (row_base + row) * n + col;
+                let old = c_data[idx].to_f32().unwrap_or(0.0);
+                c_data[idx] =
+                    T::from(beta_f32 * old + alpha_f32 * sums[row]).unwrap_or(T::zero());
             }
         }
     }
