@@ -1,16 +1,229 @@
-use crate::tensor::Tensor;
+use crate::model::config::RopeScaling;
+use crate::core::tensor::Tensor;
+use crate::model::params::Weight;
+use crate::runtime::cpu;
+use crate::core::operators::quant::generic::{
+    matmul_transb_gguf_quant,
+    matmul_transb_gguf_quant_batch2,
+    matmul_transb_gguf_quant_batch3,
+};
 use num_traits::float::Float;
 use num_traits::Num;
 use num_traits::{FromPrimitive, ToPrimitive};
-use std::cmp::Ordering;
-use std::fmt::Debug;
 use gemm::{Parallelism};
-use std::any::TypeId;
 use rayon::prelude::*;
 
-// 可性能优化！
-// get (row) vectors from a 2D table given a list of indices
-/// 为什么这里的 indices 的类型是 Tensor<u32> 呢？
+use std::fmt::Debug;
+use std::any::TypeId;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct RopeFreqKey {
+    d: usize,
+    theta_bits: u32,
+    use_llama3_scaling: bool,
+    factor_bits: u32,
+    orig_max_pos: usize,
+    low_freq_factor_bits: u32,
+    high_freq_factor_bits: u32,
+}
+
+static ROPE_INV_FREQ_CACHE: OnceLock<Mutex<HashMap<RopeFreqKey, Arc<Vec<f32>>>>> = OnceLock::new();
+
+#[inline]
+fn build_rope_inv_freqs(
+    d: usize,
+    theta_f32: f32,
+    use_llama3_scaling: bool,
+    factor: f32,
+    orig_max_pos: f32,
+    low_freq_factor: f32,
+    high_freq_factor: f32,
+) -> Vec<f32> {
+    let half = d / 2;
+    let mut out = vec![0.0f32; half];
+    let d_f32 = d as f32;
+    let two_f32 = 2.0_f32;
+
+    let low_freq_wavelen = if use_llama3_scaling {
+        orig_max_pos / low_freq_factor
+    } else {
+        0.0
+    };
+    let high_freq_wavelen = if use_llama3_scaling {
+        orig_max_pos / high_freq_factor
+    } else {
+        0.0
+    };
+
+    for i in 0..half {
+        let i_f32 = i as f32;
+        let exponent = (two_f32 * i_f32) / d_f32;
+        let freq_base = theta_f32.powf(-exponent);
+        out[i] = if use_llama3_scaling {
+            let wavelen = (2.0 * std::f32::consts::PI) / freq_base;
+            if wavelen < high_freq_wavelen {
+                freq_base
+            } else if wavelen > low_freq_wavelen {
+                freq_base / factor
+            } else {
+                let denom = high_freq_factor - low_freq_factor;
+                let smooth = if denom.abs() > 1e-6 {
+                    (orig_max_pos / wavelen - low_freq_factor) / denom
+                } else {
+                    0.0
+                };
+                (1.0 - smooth) * (freq_base / factor) + smooth * freq_base
+            }
+        } else {
+            freq_base
+        };
+    }
+
+    out
+}
+
+#[inline]
+fn rope_inv_freqs_cached(
+    d: usize,
+    theta_f32: f32,
+    use_llama3_scaling: bool,
+    factor: f32,
+    orig_max_pos: f32,
+    low_freq_factor: f32,
+    high_freq_factor: f32,
+) -> Arc<Vec<f32>> {
+    let key = RopeFreqKey {
+        d,
+        theta_bits: theta_f32.to_bits(),
+        use_llama3_scaling,
+        factor_bits: factor.to_bits(),
+        orig_max_pos: orig_max_pos as usize,
+        low_freq_factor_bits: low_freq_factor.to_bits(),
+        high_freq_factor_bits: high_freq_factor.to_bits(),
+    };
+
+    let cache = ROPE_INV_FREQ_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap();
+    if let Some(v) = guard.get(&key) {
+        return Arc::clone(v);
+    }
+
+    let built = Arc::new(build_rope_inv_freqs(
+        d,
+        theta_f32,
+        use_llama3_scaling,
+        factor,
+        orig_max_pos,
+        low_freq_factor,
+        high_freq_factor,
+    ));
+    guard.insert(key, Arc::clone(&built));
+    built
+}
+
+#[inline]
+fn sum_squares_f32_simd(x: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx512f") {
+            // SAFETY: 运行时已检测 avx512f。
+            return unsafe { sum_squares_f32_avx512(x) };
+        }
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: 运行时已检测 avx2。
+            return unsafe { sum_squares_f32_avx2(x) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: 仅在 aarch64 目标上编译并调用。
+        return unsafe { sum_squares_f32_neon(x) };
+    }
+
+    let mut s = 0.0f32;
+    for &v in x {
+        s += v * v;
+    }
+    s
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn sum_squares_f32_avx512(x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mut i = 0usize;
+    let n = x.len();
+    let n16 = n / 16 * 16;
+    let mut acc = _mm512_setzero_ps();
+    while i < n16 {
+        let v = _mm512_loadu_ps(x.as_ptr().add(i));
+        acc = _mm512_add_ps(acc, _mm512_mul_ps(v, v));
+        i += 16;
+    }
+    let mut tmp = [0.0f32; 16];
+    _mm512_storeu_ps(tmp.as_mut_ptr(), acc);
+    let mut s = tmp.iter().sum::<f32>();
+    while i < n {
+        s += x[i] * x[i];
+        i += 1;
+    }
+    s
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sum_squares_f32_avx2(x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mut i = 0usize;
+    let n = x.len();
+    let n8 = n / 8 * 8;
+    let mut acc = _mm256_setzero_ps();
+    while i < n8 {
+        let v = _mm256_loadu_ps(x.as_ptr().add(i));
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(v, v));
+        i += 8;
+    }
+    let mut tmp = [0.0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+    let mut s = tmp.iter().sum::<f32>();
+    while i < n {
+        s += x[i] * x[i];
+        i += 1;
+    }
+    s
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn sum_squares_f32_neon(x: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let mut i = 0usize;
+    let n = x.len();
+    let n4 = n / 4 * 4;
+    let mut acc = vdupq_n_f32(0.0);
+    while i < n4 {
+        let v = vld1q_f32(x.as_ptr().add(i));
+        acc = vaddq_f32(acc, vmulq_f32(v, v));
+        i += 4;
+    }
+    let mut tmp = [0.0f32; 4];
+    vst1q_f32(tmp.as_mut_ptr(), acc);
+    let mut s = tmp.iter().sum::<f32>();
+    while i < n {
+        s += x[i] * x[i];
+        i += 1;
+    }
+    s
+}
+
+
+/// 可性能优化！
+/// 
+/// get (row) vectors from a 2D table given a list of indices
 pub fn gather<T>(y: &mut Tensor<T>, indices: &Tensor<u32>, table: &Tensor<T>) 
     where T: Default + Num + Copy + Float
 {
@@ -27,9 +240,10 @@ pub fn gather<T>(y: &mut Tensor<T>, indices: &Tensor<u32>, table: &Tensor<T>)
 }
 
 /// f32 转换计算改造完成
+/// 改造 llama 3 完成
 /// RoPE: Rotary Positional Embedding 旋转位置编码
 /// 需要性能优化
-pub fn rope<T>(y: &mut Tensor<T>, start_pos: usize, theta: impl Float) 
+pub fn rope<T>(y: &mut Tensor<T>, start_pos: usize, theta: f32, scaling: &RopeScaling) 
     where T: Float + Default + FromPrimitive +  Copy + Into<f32>
 {
     let shape = y.shape();
@@ -38,23 +252,48 @@ pub fn rope<T>(y: &mut Tensor<T>, start_pos: usize, theta: impl Float)
     let n_heads = shape[1];
     let d = shape[2];
     let data = unsafe { y.data_mut() };
-    let d_f32 = d as f32;
-    let two_f32 = 2.0_f32;
     let theta_f32: f32 = theta.to_f32().unwrap_or(0.0);
+    let use_llama3_scaling = scaling.rope_type == "llama3"
+        && scaling.factor > 0.0
+        && scaling.original_max_position_embeddings > 0
+        && scaling.low_freq_factor > 0.0
+        && scaling.high_freq_factor > 0.0;
+    let factor = scaling.factor;
+    let orig_max_pos = scaling.original_max_position_embeddings as f32;
+    let low_freq_factor = scaling.low_freq_factor;
+    let high_freq_factor = scaling.high_freq_factor;
+    let half = d / 2;
+    let inv_freqs = rope_inv_freqs_cached(
+        d,
+        theta_f32,
+        use_llama3_scaling,
+        factor,
+        orig_max_pos,
+        low_freq_factor,
+        high_freq_factor,
+    );
+    let mut sin_cache = vec![0.0f32; half];
+    let mut cos_cache = vec![0.0f32; half];
+
     for tok in 0..seq_len {
         let pos = start_pos + tok;
         let pos_f32 = pos as f32;
+        for i in 0..half {
+            let phase = pos_f32 * inv_freqs[i];
+            let (sin, cos) = phase.sin_cos();
+            sin_cache[i] = sin;
+            cos_cache[i] = cos;
+        }
+
         for head in 0..n_heads {
             let base_offset = tok * n_heads * d + head * d;
-            for i in 0..d / 2 {
-                let i_f32 = i as f32;
+            for i in 0..half {
                 let idx_a = base_offset + i;
-                let idx_b = base_offset + i + (d/2);
+                let idx_b = base_offset + i + half;
                 let a_f32: f32 = data[idx_a].into();
                 let b_f32: f32 = data[idx_b].into();
-                let exponent = (two_f32 * i_f32) / d_f32;
-                let freq = pos_f32 / theta_f32.powf(exponent);
-                let (sin, cos) = freq.sin_cos();
+                let sin = sin_cache[i];
+                let cos = cos_cache[i];
                 let new_a = a_f32* cos - b_f32 * sin;
                 let new_b = b_f32 * cos + a_f32 * sin;
                 data[idx_a] = T::from(new_a).unwrap_or(T::zero());
@@ -70,8 +309,9 @@ pub fn rope<T>(y: &mut Tensor<T>, start_pos: usize, theta: impl Float)
 /// 带有 mask 的 softmax 
 /// 先 mask 后进行 softmax 
 /// 如何保障f16计算正确？计算前先将 T 类型全部转换成 f32 来计算？那么你精度转换是何意味？
+/// 精度转换是为了计算时不出现溢出等异常现象，最后会统一将 f32 转换回 T 格式！减少内存占用！
 pub fn masked_softmax<T>(y: &mut Tensor<T>) 
-    where T: Float + Default + std::iter::Sum + FromPrimitive + Debug
+    where T: Float + Default + std::iter::Sum + FromPrimitive + Debug + 'static
 {
     let ndim = y.shape().len();
     assert!(ndim >= 2);
@@ -79,6 +319,41 @@ pub fn masked_softmax<T>(y: &mut Tensor<T>)
     let total_seq_len = y.shape()[ndim - 1];
     let batch = y.size() / (seq_len * total_seq_len);
     let data = unsafe { y.data_mut() };
+
+    // f32 快路径：避免反复 to_f32/from_f32 和临时 exp buffer。
+    if TypeId::of::<T>() == TypeId::of::<f32>() {
+        let data_f32 = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut f32, data.len()) };
+        data_f32
+            .par_chunks_mut(total_seq_len)
+            .enumerate()
+            .for_each(|(row_idx, row)| {
+                let i = row_idx % seq_len;
+                let boundary = total_seq_len - seq_len + i + 1;
+
+                let mut max = row[0];
+                for &v in &row[..boundary] {
+                    if v > max {
+                        max = v;
+                    }
+                }
+
+                let mut sum_exp = 0.0f32;
+                for v in &mut row[..boundary] {
+                    *v = (*v - max).exp();
+                    sum_exp += *v;
+                }
+
+                let inv = 1.0f32 / sum_exp.max(1e-12);
+                for v in &mut row[..boundary] {
+                    *v *= inv;
+                }
+                for v in &mut row[boundary..] {
+                    *v = 0.0;
+                }
+            });
+        return;
+    }
+
     for b in 0..batch {
         let base = b * seq_len * total_seq_len;
         for i in 0..seq_len {
@@ -115,7 +390,7 @@ pub fn masked_softmax<T>(y: &mut Tensor<T>)
 /// 这样，第 N 层就不需要关心第 N-1 层的具体数值范围是多少，它只需要处理标准化的数据。这就解耦了层与层之间的依赖，让深层网络的训练成为可能
 /// 对输入的 x 进行归一化操作，并将结果保存在 y 中
 pub fn rms_norm<T>(y: &mut Tensor<T>, x: &Tensor<T>, w: &Tensor<T>, epsilon: impl Float) 
-    where T: Float + std::iter::Sum + Default
+    where T: Float + std::iter::Sum + Default + 'static
 {
     assert!(y.size() == x.size());
     // 获取维度数
@@ -138,6 +413,31 @@ pub fn rms_norm<T>(y: &mut Tensor<T>, x: &Tensor<T>, w: &Tensor<T>, epsilon: imp
     let y = unsafe { y.data_mut() };
     let x = x.data();
     let w = w.data();
+
+    if TypeId::of::<T>() == TypeId::of::<f32>() {
+        let y_f32 = unsafe { std::slice::from_raw_parts_mut(y.as_mut_ptr() as *mut f32, y.len()) };
+        let x_f32 = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const f32, x.len()) };
+        let w_f32 = unsafe { std::slice::from_raw_parts(w.as_ptr() as *const f32, w.len()) };
+        let eps = epsilon.to_f32().unwrap_or(0.0);
+        let inv_hidden = 1.0f32 / hidden_size as f32;
+
+        for b in 0..batch {
+            let base = b * seq_len * hidden_size;
+            for l in 0..seq_len {
+                let offset = base + l * hidden_size;
+                let x_row = &x_f32[offset..offset + hidden_size];
+                let y_row = &mut y_f32[offset..offset + hidden_size];
+                let sum_sq = sum_squares_f32_simd(x_row);
+                let inv_rms = 1.0f32 / (sum_sq * inv_hidden + eps).sqrt();
+
+                for i in 0..hidden_size {
+                    y_row[i] = x_row[i] * w_f32[i] * inv_rms;
+                }
+            }
+        }
+        return;
+    }
+
     // 遍历每个批次
     for b in 0..batch {
         // 当前批次的基索引
@@ -169,11 +469,53 @@ pub fn rms_norm<T>(y: &mut Tensor<T>, x: &Tensor<T>, w: &Tensor<T>, epsilon: imp
 /// y = sigmoid(x) * x * y
 /// Swish/SiLU 激活函数
 pub fn silu<T>(y: &mut Tensor<T>, x: &Tensor<T>) 
-    where T: Float + Default + FromPrimitive + ToPrimitive + Copy
+    where T: Float + Default + FromPrimitive + ToPrimitive + Copy + 'static
 {
     debug_assert!(y.size() == x.size());
     let y_data = unsafe {y.data_mut()};
     let x_data = x.data();
+
+    if TypeId::of::<T>() == TypeId::of::<f32>() {
+        let y_f32 = unsafe { std::slice::from_raw_parts_mut(y_data.as_mut_ptr() as *mut f32, y_data.len()) };
+        let x_f32 = unsafe { std::slice::from_raw_parts(x_data.as_ptr() as *const f32, x_data.len()) };
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                // SAFETY: 运行时已检测 avx2。
+                unsafe {
+                    use std::arch::x86_64::*;
+                    let mut i = 0usize;
+                    let n = y_f32.len();
+                    while i + 8 <= n {
+                        let mut s = [0.0f32; 8];
+                        for j in 0..8 {
+                            let xv = x_f32[i + j];
+                            s[j] = xv / (1.0 + (-xv).exp());
+                        }
+                        let vy = _mm256_loadu_ps(y_f32.as_ptr().add(i));
+                        let vs = _mm256_loadu_ps(s.as_ptr());
+                        let out = _mm256_mul_ps(vy, vs);
+                        _mm256_storeu_ps(y_f32.as_mut_ptr().add(i), out);
+                        i += 8;
+                    }
+                    while i < n {
+                        let xv = x_f32[i];
+                        y_f32[i] *= xv / (1.0 + (-xv).exp());
+                        i += 1;
+                    }
+                }
+                return;
+            }
+        }
+
+        for i in 0..y_f32.len() {
+            let xv = x_f32[i];
+            y_f32[i] *= xv / (1.0 + (-xv).exp());
+        }
+        return;
+    }
+
     y_data.iter_mut().zip(x_data.iter()).for_each(|(y_val,x_val)|{
         let x_f32 = x_val.to_f32().unwrap_or(0.0);
         let exp_neg_x = (-x_f32).exp();
@@ -181,6 +523,105 @@ pub fn silu<T>(y: &mut Tensor<T>, x: &Tensor<T>)
         let silu_val = T::from(silu_val_f32).unwrap_or(T::zero());
         *y_val = *y_val * silu_val;
     });
+}
+
+/// Matrix multiply with weight dispatch.
+///
+/// This is the key entry for real quantized inference:
+/// - dense weights -> existing float matmul path
+pub fn matmul_transb_weight<T>(
+    c: &mut Tensor<T>,
+    beta: T,
+    a: &Tensor<T>,
+    b: &Weight<T>,
+    alpha: T,
+) where
+    T: Float + Default + Copy + std::iter::Sum + Send + Sync + 'static,
+{
+    match b {
+        Weight::Dense(w) => matmul_transb(c, beta, a, w, alpha),
+        Weight::GgufQ(wq) => matmul_transb_gguf_quant(c, beta, a, wq, alpha),
+    }
+}
+
+pub fn matmul_transb_weight_batch2<T>(
+    c0: &mut Tensor<T>,
+    c1: &mut Tensor<T>,
+    beta: T,
+    a: &Tensor<T>,
+    b0: &Weight<T>,
+    b1: &Weight<T>,
+    alpha: T,
+) where
+    T: Float + Default + Copy + std::iter::Sum + Send + Sync + 'static,
+{
+    match (b0, b1) {
+        // gate/up 若已在加载期构建条带布局，则默认直接走 batch2 量化路径。
+        // 旧 dense workset 仅保留为实验开关兜底。
+        (Weight::GgufQ(wq0), Weight::GgufQ(wq1))
+            if a.shape().len() == 2
+                && a.shape()[0] > 1
+                && wq0.tensor_type == wq1.tensor_type
+                && wq0.cols() == wq1.cols()
+                && (wq0.prefill_packed.is_some()
+                    || wq1.prefill_packed.is_some()
+                    || wq0.prefill_q8k_interleave.is_some()
+                    || wq1.prefill_q8k_interleave.is_some()
+                    || wq0.prefill_stripes.is_some()
+                    || std::env::var("LMRS_PREFILL_GATEUP_WORKSET")
+                        .ok()
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)) =>
+        {
+            matmul_transb_gguf_quant_batch2(c0, c1, beta, a, wq0, wq1, alpha)
+        }
+        _ => {
+            rayon::join(
+                || matmul_transb_weight(c0, beta, a, b0, alpha),
+                || matmul_transb_weight(c1, beta, a, b1, alpha),
+            );
+        }
+    }
+}
+
+pub fn matmul_transb_weight_batch3<T>(
+    c0: &mut Tensor<T>,
+    c1: &mut Tensor<T>,
+    c2: &mut Tensor<T>,
+    beta: T,
+    a: &Tensor<T>,
+    b0: &Weight<T>,
+    b1: &Weight<T>,
+    b2: &Weight<T>,
+    alpha: T,
+) where
+    T: Float + Default + Copy + std::iter::Sum + Send + Sync + 'static,
+{
+    match (b0, b1, b2) {
+        // QKV 的阶段九默认路径同样改为“量化预打包工作集 + 大 GEMM”。
+        // 实验开关只负责更激进的并行展开，不再决定是否启用这条主路径。
+        (Weight::GgufQ(wq0), Weight::GgufQ(wq1), Weight::GgufQ(wq2))
+            if a.shape().len() == 2
+                && a.shape()[0] > 1
+                && wq0.tensor_type == wq1.tensor_type
+                && wq0.tensor_type == wq2.tensor_type
+                && wq0.cols() == wq1.cols()
+                && wq0.cols() == wq2.cols() =>
+        {
+            matmul_transb_gguf_quant_batch3(c0, c1, c2, beta, a, wq0, wq1, wq2, alpha)
+        }
+        _ => {
+            rayon::join(
+                || matmul_transb_weight(c0, beta, a, b0, alpha),
+                || {
+                    rayon::join(
+                        || matmul_transb_weight(c1, beta, a, b1, alpha),
+                        || matmul_transb_weight(c2, beta, a, b2, alpha),
+                    );
+                },
+            );
+        }
+    }
 }
 
 /// gemm 库深度优化版本
@@ -235,7 +676,7 @@ pub fn matmul_transb<T>(c: &mut Tensor<T>, beta: T, a: &Tensor<T>, b: &Tensor<T>
                 false,
                 false,
                 false,
-                Parallelism::Rayon(0),
+                Parallelism::Rayon(cpu::prefill_threads()),
             );
         }
         return;
@@ -364,6 +805,8 @@ pub fn matmul_transb<T>(c: &mut Tensor<T>, beta: T, a: &Tensor<T>, b: &Tensor<T>
     }
 }
 
+
+
 /// f32 转换计算改造完成
 /// 无任何优化版本
 /// C = beta * C + alpha * A @ B^T，@指的是矩阵乘法
@@ -485,112 +928,7 @@ pub fn dot<T>(x: &Tensor<T>, y: &Tensor<T>) -> T
     T::from(sum).unwrap()
 }
 
-/// f32 转换计算改造完成
-/// Sample a index from a tensor (treated as a probability vector)
-/// 从张量中根据温度、top-k和top-p随机采样出一个词元的索引
-/// top-p 累计概率阈值，只保留累计概率达到 top-p 的这些词
-/// top-k 只保留概率最高的 k 个词
-/// temperature: 温度系数。
-/// temp > 1: 增加随机性（分布更平坦）。
-/// temp < 1: 减少随机性（分布更尖锐，倾向于高概率词）。
-/// temp = 0 或极低：退化为贪婪搜索（Greedy Search），只选概率最大的词。
-pub fn random_sample<T>(x: &Tensor<T>, history: &Vec::<u32>, top_p: f32, top_k: u32, temperature: f32, penalty: f32) -> u32 
-    where T: Float + Default + FromPrimitive + Into<f32>
-{
-    assert!(x.shape()[x.shape().len() - 1] == x.size());
-    // 当采样参数无效或温度为零时，退化为“贪婪模式”（Greedy Search），直接返回概率（或 Logits）最大的那个词的索引
-    if temperature <= 0. || top_k < 2 || top_p <= 0. {
-        return x
-            .data()
-            .iter()
-            .enumerate()
-            .filter(|(_, i)| i.is_normal() || i.is_zero())
-            .max_by(|(_, &a), (_, &b)| {
-                if a > b {
-                    Ordering::Greater
-                }else if a < b{
-                    Ordering::Less
-                }else{
-                    Ordering::Equal
-                }
-            })
-            .unwrap()
-            .0 as u32;
-    }
 
-    #[derive(Clone, Copy, PartialEq, Debug)]
-    struct Probability <T: Float + Copy>{
-        val: T,
-        tok: u32,
-    }
-    impl<T: Float + Copy> Eq for Probability<T>{}
-    impl<T: Float + Copy> PartialOrd for Probability<T> {
-        #[inline]
-        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-    impl<T: Float + Copy> Ord for Probability<T>{
-        #[inline]
-        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            if self.val > other.val {
-                std::cmp::Ordering::Less
-            } else if self.val < other.val {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        }
-    }
-    impl<T: Float + Copy> From<(usize, &T)> for Probability<T> {
-        #[inline]
-        fn from((i, p): (usize, &T)) -> Self {
-            Self {
-                val: *p,
-                tok: i as u32,
-            }
-        }
-    }
-
-    // sort
-    let mut logits = x
-        .data()
-        .iter()
-        .enumerate()
-        .filter(|(_, i)| i.is_normal() || i.is_zero())
-        .map(Probability::from)
-        .collect::<Vec<_>>();
-
-    // 惩罚
-    if penalty != 1.0 && !history.is_empty(){
-        for item in logits.iter_mut(){
-            if history.contains(&item.tok){
-                let mut val_f32: f32 = item.val.into();
-                if val_f32 > 0.0{
-                    val_f32 /= penalty;
-                }else{
-                    val_f32 *= penalty;
-                }
-                item.val = T::from(val_f32).unwrap_or(T::zero());
-            }
-        }
-    }
-
-    logits.sort_unstable();
-    let max = core::mem::replace(&mut logits[0].val, T::from(1.).unwrap());
-    // softmax & sum
-    let temperature = T::from(temperature).unwrap();
-    logits.iter_mut().skip(1).fold(T::one(), |prev, p| {
-        p.val = prev + ((p.val - max) / temperature).exp();
-        p.val
-    });
-    // topk & topp & random
-    let pk = logits[(top_k as usize).min(logits.len()) - 1].val;
-    let pp = logits[logits.len() - 1].val * T::from(top_p).unwrap();
-    let plimit = T::from(rand::random::<f32>()).unwrap() * T::min(pk, pp);
-    // sample
-    logits.iter().find(|p| p.val >= plimit).unwrap().tok
-}
 
 
 #[test]
@@ -630,4 +968,40 @@ fn test_matmul_transb() {
         &Tensor::<f32>::new(vec![15., 34., 35., 81.], &vec![2, 2]),
         1e-3
     ));
+}
+
+
+#[test]
+fn test_matmul_transb_weight_ggufq_q4_0() {
+    use crate::formats::gguf::QuantGGUFTensor;
+    use gguf::GGMLType;
+    //use crate::core::operators::quant::generic::matmul_transb_weight;
+    use crate::model::params::Weight;
+
+    // 走通用 GGUF 量化 kernel 的最小用例（Q4_0）。
+    // d=1，qs 全 0x98 => 低4位=8, 高4位=9，Q4_0 会减去 8，得到重复 [0, 1]。
+    let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+    let mut raw = Vec::<u8>::new();
+    raw.extend_from_slice(&d_bits);
+    raw.extend_from_slice(&[0x98u8; 16]);
+
+    let wq = QuantGGUFTensor {
+        raw,
+        shape: vec![1, 32],
+        tensor_type: GGMLType::Q4_0,
+        row_map: None,
+        prefill_workset: None,
+        prefill_packed: None,
+        prefill_k_metadata: None,
+        prefill_q8k_interleave: None,
+        prefill_stripes: None,
+        hot_layer: false,
+    };
+
+    let a = Tensor::<f32>::new(vec![1.0; 32], &vec![1, 32]);
+    let mut c = Tensor::<f32>::default(&vec![1, 1]);
+    matmul_transb_weight(&mut c, 0.0, &a, &Weight::GgufQ(wq), 1.0);
+
+    // 16 * (0 + 1) = 16
+    assert!(c.close_to(&Tensor::<f32>::new(vec![16.0], &vec![1, 1]), 1e-6));
 }

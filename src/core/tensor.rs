@@ -1,4 +1,6 @@
-use std::{slice, sync::Arc, vec};
+use std::{mem::size_of, slice, sync::Arc, vec};
+
+use crate::runtime::cpu;
 pub struct Tensor<T> {
     data: Arc<Box<[T]>>,
     shape: Vec<usize>,
@@ -8,7 +10,10 @@ pub struct Tensor<T> {
 
 impl<T: Copy + Clone + Default> Tensor<T> {
     pub fn new(data: Vec<T>, shape: &Vec<usize>) -> Self {
+        let mut data = data;
         let length = data.len();
+        // 第四阶段的大页提示只对大块连续内存生效，小张量不值得触发 madvise。
+        cpu::maybe_advise_hugepage(data.as_mut_ptr() as *mut u8, length * size_of::<T>());
         Tensor {
             data: Arc::new(data.into_boxed_slice().try_into().unwrap()),
             shape: shape.clone(),

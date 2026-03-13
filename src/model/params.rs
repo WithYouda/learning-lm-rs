@@ -1,7 +1,29 @@
+use crate::model::config::LlamaConfigJson;
+use crate::core::tensor::Tensor;
+use crate::formats::gguf::*;
+
+
 use num_traits::Num;
-use half::f16;
-use crate::{config::LlamaConfigJson, tensor::Tensor};
 use safetensors::SafeTensors;
+
+
+
+/// A model weight can either be a classic dense tensor or a quantized matrix.
+pub enum Weight<T> {
+    Dense(Tensor<T>),
+    GgufQ(QuantGGUFTensor),
+}
+
+impl<T> Weight<T> {
+    #[allow(unused)]
+    pub fn as_dense(&self) -> &Tensor<T> {
+        match self {
+            Weight::Dense(t) => t,
+            Weight::GgufQ(_) => panic!("called as_dense() on quantized weight"),
+        }
+    }
+}
+
 pub struct LLamaParams<T> {
     // token_id to embedding lookup table
     // (vocab_size, dim)
@@ -10,27 +32,27 @@ pub struct LLamaParams<T> {
     // (hidden_size, ) x layers
     pub rms_att_w: Vec<Tensor<T>>, 
     // (n_heads * head_size, hidden_size) x layers
-    pub wq: Vec<Tensor<T>>,  
+    pub wq: Vec<Weight<T>>,  
     // (n_kv_heads * head_size, hidden_size) x layers      
-    pub wk: Vec<Tensor<T>>,   
+    pub wk: Vec<Weight<T>>,   
     // (n_kv_heads * head_size, hidden_size) x layers     
-    pub wv: Vec<Tensor<T>>,  
+    pub wv: Vec<Weight<T>>,  
     // (hidden_size, n_heads * head_size) x layers      
-    pub wo: Vec<Tensor<T>>,        
+    pub wo: Vec<Weight<T>>,        
     // ffn layer 前馈网络层
     // (hidden_size, ) x layers
     pub rms_ffn_w: Vec<Tensor<T>>, 
     // (intermediate_size, hidden_size) x layers
-    pub w_up: Vec<Tensor<T>>,      
+    pub w_up: Vec<Weight<T>>,      
     // (intermediate_size, hidden_size) x layers
-    pub w_gate: Vec<Tensor<T>>,   
+    pub w_gate: Vec<Weight<T>>,   
     // (hidden_size, intermediate_size) x layers 
-    pub w_down: Vec<Tensor<T>>,    
+    pub w_down: Vec<Weight<T>>,    
     // output 输出层
     // (hidden_size, )
     pub rms_out_w: Tensor<T>, 
     // (vocab_size, dim)
-    pub lm_head: Tensor<T>,   
+    pub lm_head: Weight<T>,   
 }
 
 /// 将一个类型的tensor转换成特定的类型的迭代器
@@ -51,6 +73,7 @@ trait GetTensorFromSafeTensors<P: Num> {
 impl GetTensorFromSafeTensors<f32> for f32 {
     fn get_tensor_from(tensors: &SafeTensors, name: &str) -> Result<Tensor<f32>, &'static str> {
         let tensor_view = tensors.tensor(name).map_err(|e| {
+            eprintln!("{} tensor not found",name);
             assert!(matches!(e, safetensors::SafeTensorError::TensorNotFound(_)));
             "Tensor not found"
         })?;
@@ -86,6 +109,7 @@ impl GetTensorFromSafeTensors<f32> for f32 {
 impl GetTensorFromSafeTensors<half::f16> for half::f16 {
     fn get_tensor_from(tensors: &SafeTensors, name: &str) -> Result<Tensor<half::f16>, &'static str> {
         let tensor_view = tensors.tensor(name).map_err(|e| {
+            eprintln!("{} tensor not found",name);
             assert!(matches!(e, safetensors::SafeTensorError::TensorNotFound(_)));
             "Tensor not found"
         })?;
@@ -118,6 +142,7 @@ impl GetTensorFromSafeTensors<half::f16> for half::f16 {
 impl GetTensorFromSafeTensors<half::bf16> for half::bf16 {
     fn get_tensor_from(tensors: &SafeTensors, name: &str) -> Result<Tensor<half::bf16>, &'static str> {
         let tensor_view = tensors.tensor(name).map_err(|e| {
+            eprintln!("{} tensor not found",name);
             assert!(matches!(e, safetensors::SafeTensorError::TensorNotFound(_)));
             "Tensor not found"
         })?;
@@ -145,7 +170,7 @@ impl GetTensorFromSafeTensors<half::bf16> for half::bf16 {
     }
 }
 
-/// 为每个类型生成对应的LlamaParams 结构体
+/// 从 safetensor 为每个类型生成对应的LlamaParams 结构体
 macro_rules! impl_from_safetensors_for_LlamaParams {
     ($Param:ty) => {
         impl LLamaParams<$Param> {
@@ -157,32 +182,53 @@ macro_rules! impl_from_safetensors_for_LlamaParams {
                                 <$Param>::get_tensor_from(tensors, &format!($name_pattern, i))
                                     .unwrap()
                             })
-                            .collect()
+                            .collect::<Vec<Tensor<$Param>>>()
                     };
                 }
 
                 LLamaParams {
-                    embedding_table: if config.tie_word_embeddings {
+                    embedding_table: if !config.tie_word_embeddings {
                         <$Param>::get_tensor_from(tensors, "lm_head.weight").unwrap()
                     } else {
                         <$Param>::get_tensor_from(tensors, "model.embed_tokens.weight").unwrap()
                     },
 
                     rms_att_w: get_tensor_vec!("model.layers.{}.input_layernorm.weight"),
-                    wq: get_tensor_vec!("model.layers.{}.self_attn.q_proj.weight"),
-                    wk: get_tensor_vec!("model.layers.{}.self_attn.k_proj.weight"),
-                    wv: get_tensor_vec!("model.layers.{}.self_attn.v_proj.weight"),
-                    wo: get_tensor_vec!("model.layers.{}.self_attn.o_proj.weight"),
+                    wq: get_tensor_vec!("model.layers.{}.self_attn.q_proj.weight")
+                        .into_iter()
+                        .map(Weight::Dense)
+                        .collect(),
+                    wk: get_tensor_vec!("model.layers.{}.self_attn.k_proj.weight")
+                        .into_iter()
+                        .map(Weight::Dense)
+                        .collect(),
+                    wv: get_tensor_vec!("model.layers.{}.self_attn.v_proj.weight")
+                        .into_iter()
+                        .map(Weight::Dense)
+                        .collect(),
+                    wo: get_tensor_vec!("model.layers.{}.self_attn.o_proj.weight")
+                        .into_iter()
+                        .map(Weight::Dense)
+                        .collect(),
 
                     rms_ffn_w: get_tensor_vec!("model.layers.{}.post_attention_layernorm.weight"),
-                    w_up: get_tensor_vec!("model.layers.{}.mlp.up_proj.weight"),
-                    w_gate: get_tensor_vec!("model.layers.{}.mlp.gate_proj.weight"),
-                    w_down: get_tensor_vec!("model.layers.{}.mlp.down_proj.weight"),
+                    w_up: get_tensor_vec!("model.layers.{}.mlp.up_proj.weight")
+                        .into_iter()
+                        .map(Weight::Dense)
+                        .collect(),
+                    w_gate: get_tensor_vec!("model.layers.{}.mlp.gate_proj.weight")
+                        .into_iter()
+                        .map(Weight::Dense)
+                        .collect(),
+                    w_down: get_tensor_vec!("model.layers.{}.mlp.down_proj.weight")
+                        .into_iter()
+                        .map(Weight::Dense)
+                        .collect(),
 
-                    lm_head: if config.tie_word_embeddings{
-                        <$Param>::get_tensor_from(tensors, "lm_head.weight").unwrap()
+                    lm_head: if !config.tie_word_embeddings{
+                        Weight::Dense(<$Param>::get_tensor_from(tensors, "lm_head.weight").unwrap())
                     }else{
-                        <$Param>::get_tensor_from(tensors, "model.embed_tokens.weight").unwrap()
+                        Weight::Dense(<$Param>::get_tensor_from(tensors, "model.embed_tokens.weight").unwrap())
                     },
                     rms_out_w: <$Param>::get_tensor_from(tensors, "model.norm.weight").unwrap(),
                 }
@@ -194,3 +240,30 @@ macro_rules! impl_from_safetensors_for_LlamaParams {
 impl_from_safetensors_for_LlamaParams!(f32);
 impl_from_safetensors_for_LlamaParams!(half::f16);
 impl_from_safetensors_for_LlamaParams!(half::bf16);
+
+
+
+pub trait FromF32 {
+    fn from_f32_vec(v: Vec<f32>) -> Vec<Self>
+    where
+        Self: Sized;
+}
+
+impl FromF32 for f32 {
+    fn from_f32_vec(v: Vec<f32>) -> Vec<Self> {
+        v
+    }
+}
+
+impl FromF32 for half::f16 {
+    fn from_f32_vec(v: Vec<f32>) -> Vec<Self> {
+        v.into_iter().map(half::f16::from_f32).collect()
+    }
+}
+
+impl FromF32 for half::bf16 {
+    fn from_f32_vec(v: Vec<f32>) -> Vec<Self> {
+        v.into_iter().map(half::bf16::from_f32).collect()
+    }
+}
+
