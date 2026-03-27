@@ -1,3 +1,6 @@
 [build]
 # 第四阶段编译器审计：默认启用 native 指令集，避免发布基准继续跑在保守目标上。
 rustflags = ["-C", "target-cpu=native"]
+
+[alias]
+run-server = "run --release --bin server"

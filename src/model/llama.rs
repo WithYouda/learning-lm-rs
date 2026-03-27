@@ -1130,6 +1130,11 @@ impl<T> Llama<T>
         KVCache::new(self.n_layers, self.max_seq_len, self.n_kv_h * self.dqkv, 0)
     }
 
+    /// 获取结束token id列表（供外部流式生成判断是否停止）
+    pub fn eos_token_ids(&self) -> &[u32] {
+        &self.eos_token_id
+    }
+
     // 为什么input的类型是Tensor<u32>?
     // 因为input是输入的 token_id序列，而 token_id 是正整数
     /// 向前传播方法

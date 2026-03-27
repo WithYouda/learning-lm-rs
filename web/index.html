@@ -1,0 +1,1194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LM-RS 推理界面</title>
+  <style>
+    /* ===================== 全局 ===================== */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:       #0f1117;
+      --surface:  #1a1d27;
+      --panel:    #22263a;
+      --border:   #2e3350;
+      --accent:   #6c63ff;
+      --accent2:  #a78bfa;
+      --success:  #34d399;
+      --warn:     #fbbf24;
+      --danger:   #f87171;
+      --text:     #e2e8f0;
+      --muted:    #94a3b8;
+      --radius:   10px;
+      --shadow:   0 4px 24px rgba(0,0,0,.45);
+      --font:     'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    }
+    /* ===== 白天模式覆盖 ===== */
+    [data-theme="light"] {
+      --bg:      #f0f4f8;
+      --surface: #ffffff;
+      --panel:   #f8fafc;
+      --border:  #cbd5e1;
+      --text:    #1e293b;
+      --muted:   #64748b;
+      --shadow:  0 4px 24px rgba(0,0,0,.10);
+    }
+    [data-theme="light"] .msg.assistant .msg-bubble { background: #fff; }
+    [data-theme="light"] #modal { background: #fff; }
+    [data-theme="light"] .form-row select,
+    [data-theme="light"] .form-row textarea,
+    [data-theme="light"] .form-row input,
+    [data-theme="light"] .param-row select,
+    [data-theme="light"] .param-row textarea,
+    [data-theme="light"] #input-textarea { background: #f0f4f8; color: var(--text); }
+    html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; transition: background .25s, color .25s; }
+
+    /* ===================== 布局：三栏 ===================== */
+    #app { display: flex; height: 100vh; }
+
+    /* 左侧会话列表栏 */
+    #sidebar {
+      width: 240px; min-width: 200px; background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; flex-shrink: 0;
+    }
+    #sidebar-header {
+      padding: 18px 16px 12px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    #sidebar-header h1 { font-size: 16px; font-weight: 700; color: var(--accent2); letter-spacing: .5px; }
+    #sidebar-header span { font-size: 11px; color: var(--muted); }
+    #session-list { flex: 1; overflow-y: auto; padding: 8px; }
+    .session-item {
+      padding: 10px 12px; border-radius: var(--radius); cursor: pointer;
+      margin-bottom: 4px; transition: background .15s; position: relative;
+      border: 1px solid transparent;
+    }
+    .session-item:hover { background: var(--panel); }
+    .session-item.active { background: var(--panel); border-color: var(--accent); }
+    .session-item .s-name { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .session-item .s-model { font-size: 11px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .session-item .s-del {
+      position: absolute; top: 50%; right: 8px; transform: translateY(-50%);
+      opacity: 0; cursor: pointer; color: var(--danger); font-size: 15px; line-height: 1;
+      transition: opacity .15s; padding: 2px 4px;
+    }
+    .session-item:hover .s-del { opacity: 1; }
+    .session-item .s-badge {
+      display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+      background: var(--success); margin-right: 5px; vertical-align: middle;
+      animation: pulse 1.2s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+    #btn-new-session {
+      margin: 10px; padding: 10px; border-radius: var(--radius);
+      background: var(--accent); color: #fff; border: none; cursor: pointer;
+      font-size: 13px; font-weight: 600; transition: opacity .15s;
+      display: flex; align-items: center; justify-content: center; gap: 6px;
+    }
+    #btn-new-session:hover { opacity: .85; }
+
+    /* 中间聊天主区域 */
+    #main {
+      flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--bg);
+    }
+    #chat-header {
+      padding: 14px 20px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+      background: var(--surface);
+    }
+    #chat-header .h-title { font-size: 15px; font-weight: 700; }
+    #chat-header .h-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .header-actions { display: flex; gap: 8px; }
+    .btn-icon {
+      padding: 6px 12px; border-radius: 7px; border: 1px solid var(--border);
+      background: var(--panel); color: var(--text); cursor: pointer; font-size: 12px;
+      transition: all .15s; display: flex; align-items: center; gap: 5px;
+    }
+    .btn-icon:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-icon.danger:hover { border-color: var(--danger); color: var(--danger); }
+
+    /* 聊天消息区 */
+    #messages {
+      flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px;
+    }
+    .msg { display: flex; gap: 10px; max-width: 860px; }
+    .msg.user { flex-direction: row-reverse; align-self: flex-end; }
+    .msg.assistant { align-self: flex-start; }
+    .msg-avatar {
+      width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center; font-size: 14px;
+      font-weight: 700;
+    }
+    .msg.user .msg-avatar { background: var(--accent); color: #fff; }
+    .msg.assistant .msg-avatar { background: var(--panel); color: var(--accent2); border: 1px solid var(--border); }
+    .msg-body { max-width: 700px; }
+    .msg-bubble {
+      padding: 10px 14px; border-radius: 14px; font-size: 14px; line-height: 1.7;
+      word-break: break-word; white-space: pre-wrap;
+    }
+    .msg.user .msg-bubble {
+      background: var(--accent); color: #fff;
+      border-bottom-right-radius: 4px;
+    }
+    .msg.assistant .msg-bubble {
+      background: var(--panel); color: var(--text);
+      border-bottom-left-radius: 4px; border: 1px solid var(--border);
+    }
+    .msg-meta { font-size: 11px; color: var(--muted); margin-top: 4px; padding: 0 2px; }
+    .msg.user .msg-meta { text-align: right; }
+
+    /* 流式光标 */
+    .streaming-cursor {
+      display: inline-block; width: 9px; height: 15px;
+      background: var(--accent2); border-radius: 2px; margin-left: 2px;
+      animation: blink .7s step-end infinite; vertical-align: text-bottom;
+    }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+    /* 等待思考动画（推理尚未输出第一个字符时） */
+    .thinking-dots { display: inline-flex; align-items: center; gap: 5px; padding: 2px 0; }
+    .thinking-dots span {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      background: var(--muted); animation: td-bounce 1.2s ease-in-out infinite;
+    }
+    .thinking-dots span:nth-child(2) { animation-delay: .2s; }
+    .thinking-dots span:nth-child(3) { animation-delay: .4s; }
+    @keyframes td-bounce { 0%,100%{transform:translateY(0);opacity:.5} 50%{transform:translateY(-7px);opacity:1} }
+
+    /* 昼/夜切换按钮 */
+    #btn-theme {
+      background: none; border: 1px solid var(--border); border-radius: 7px;
+      color: var(--muted); cursor: pointer; font-size: 15px; line-height: 1;
+      padding: 4px 7px; transition: all .15s; flex-shrink: 0;
+    }
+    #btn-theme:hover { border-color: var(--accent2); color: var(--accent2); }
+
+    /* 空状态 */
+    #empty-state {
+      flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      color: var(--muted); gap: 12px; user-select: none;
+    }
+    #empty-state .big-icon { font-size: 48px; }
+    #empty-state p { font-size: 15px; }
+
+    /* 输入区 */
+    #input-area {
+      padding: 14px 20px; border-top: 1px solid var(--border);
+      background: var(--surface);
+    }
+    #input-row { display: flex; gap: 10px; align-items: flex-end; }
+    #input-textarea {
+      flex: 1; resize: none; background: var(--panel); border: 1px solid var(--border);
+      border-radius: var(--radius); color: var(--text); font-family: var(--font);
+      font-size: 14px; padding: 10px 14px; line-height: 1.6; outline: none;
+      transition: border-color .15s; max-height: 160px; min-height: 44px;
+      overflow-y: auto;
+    }
+    #input-textarea:focus { border-color: var(--accent); }
+    #btn-send, #btn-stop {
+      padding: 10px 20px; border-radius: var(--radius); border: none;
+      font-size: 14px; font-weight: 600; cursor: pointer; transition: all .15s;
+      flex-shrink: 0; height: 44px;
+    }
+    #btn-send { background: var(--accent); color: #fff; }
+    #btn-send:hover { opacity: .85; }
+    #btn-send:disabled { opacity: .38; cursor: not-allowed; }
+    #btn-stop { background: var(--danger); color: #fff; display: none; }
+    #btn-stop:hover { opacity: .85; }
+
+    /* 右侧参数配置面板 */
+    #params-panel {
+      width: 280px; min-width: 240px; background: var(--surface);
+      border-left: 1px solid var(--border); display: flex; flex-direction: column;
+      overflow-y: auto; flex-shrink: 0;
+    }
+    #params-panel h2 {
+      padding: 16px 16px 10px; font-size: 13px; font-weight: 700; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid var(--border);
+    }
+    .params-section { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+    .params-section h3 { font-size: 12px; font-weight: 700; color: var(--accent2); margin-bottom: 12px; text-transform: uppercase; letter-spacing: .5px; }
+    .param-row { margin-bottom: 14px; }
+    .param-label { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 12px; }
+    .param-label span:first-child { color: var(--muted); }
+    .param-label .val { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+    input[type=range] {
+      width: 100%; accent-color: var(--accent); cursor: pointer; height: 4px;
+      border-radius: 2px;
+    }
+    .param-row select, .param-row input[type=text], .param-row textarea {
+      width: 100%; background: var(--panel); border: 1px solid var(--border);
+      border-radius: 7px; color: var(--text); font-family: var(--font);
+      font-size: 13px; padding: 8px 10px; outline: none; transition: border-color .15s;
+    }
+    .param-row select:focus, .param-row input[type=text]:focus, .param-row textarea:focus {
+      border-color: var(--accent);
+    }
+    .param-row textarea { resize: vertical; min-height: 80px; line-height: 1.6; }
+    .param-row label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 6px; }
+    .stat-row { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 8px; }
+    .stat-row .stat-key { color: var(--muted); }
+    .stat-row .stat-val { color: var(--text); font-variant-numeric: tabular-nums; }
+
+    /* 模态框：新建会话 */
+    #modal-overlay {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7);
+      z-index: 100; align-items: center; justify-content: center;
+    }
+    #modal-overlay.show { display: flex; }
+    #modal {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+      padding: 28px; width: 420px; max-width: 95vw; box-shadow: var(--shadow);
+    }
+    #modal h2 { font-size: 17px; font-weight: 700; margin-bottom: 20px; color: var(--accent2); }
+    .form-row { margin-bottom: 16px; }
+    .form-row label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 6px; }
+    .form-row select, .form-row textarea, .form-row input {
+      width: 100%; background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; color: var(--text); font-family: var(--font);
+      font-size: 13px; padding: 9px 12px; outline: none; transition: border-color .15s;
+    }
+    .form-row select:focus, .form-row textarea:focus, .form-row input:focus {
+      border-color: var(--accent);
+    }
+    .form-row textarea { resize: vertical; min-height: 80px; }
+    .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
+    .btn-primary {
+      padding: 9px 22px; background: var(--accent); color: #fff; border: none;
+      border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity .15s;
+    }
+    .btn-primary:hover { opacity: .85; }
+    .btn-secondary {
+      padding: 9px 22px; background: transparent; color: var(--muted);
+      border: 1px solid var(--border); border-radius: 8px; font-size: 13px;
+      cursor: pointer; transition: all .15s;
+    }
+    .btn-secondary:hover { border-color: var(--text); color: var(--text); }
+
+    /* 提示消息 Toast */
+    #toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(60px);
+      background: var(--panel); border: 1px solid var(--border); color: var(--text);
+      border-radius: 8px; padding: 10px 20px; font-size: 13px; box-shadow: var(--shadow);
+      opacity: 0; transition: all .3s; z-index: 200; pointer-events: none;
+    }
+    #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    #toast.error { border-color: var(--danger); color: var(--danger); }
+    #toast.success { border-color: var(--success); color: var(--success); }
+
+    /* 滚动条美化 */
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+    /* 设备选择按钮 */
+    .device-btn-group { display: flex; gap: 6px; }
+    .device-btn {
+      flex: 1; padding: 7px 6px; border-radius: 7px; border: 1px solid var(--border);
+      background: var(--panel); color: var(--text); font-size: 12px; cursor: pointer;
+      transition: all .15s; font-family: var(--font); text-align: center; font-weight: 600;
+      line-height: 1.4;
+    }
+    .device-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+    .device-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .device-btn:disabled { opacity: .38; cursor: not-allowed; }
+    .device-btn .dev-badge { font-size: 10px; display: block; font-weight: 400; color: var(--muted); margin-top: 2px; }
+    .device-btn.active .dev-badge { color: rgba(255,255,255,.72); }
+
+    /* 停止推理按钮（标题栏常驻版） */
+    #btn-stop-header {
+      background: var(--danger) !important; color: #fff !important;
+      border-color: var(--danger) !important; font-weight: 700;
+    }
+    #btn-stop-header:disabled {
+      background: var(--panel) !important; color: var(--muted) !important;
+      border-color: var(--border) !important; font-weight: 400;
+      opacity: .55;
+    }
+
+    /* 响应式：小屏隐藏右侧面板 */
+    @media (max-width: 900px) {
+      #params-panel { display: none; }
+    }
+    @media (max-width: 600px) {
+      #sidebar { display: none; }
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ===== 左侧：会话列表 ===== -->
+  <div id="sidebar">
+    <div id="sidebar-header">
+      <h1>🤖 LM-RS</h1>
+      <div style="display:flex;align-items:center;gap:6px">
+        <button id="btn-theme" onclick="toggleTheme()" title="切换白天/黑夜模式">🌙</button>
+        <span>推理界面</span>
+      </div>
+    </div>
+    <div id="session-list"></div>
+    <button id="btn-new-session" onclick="openNewSessionModal()">
+      <span>＋</span> 新建会话
+    </button>
+  </div>
+
+  <!-- ===== 中间：聊天主区域 ===== -->
+  <div id="main">
+
+    <!-- 顶部标题栏 -->
+    <div id="chat-header">
+      <div>
+        <div class="h-title" id="chat-title">请先创建一个会话</div>
+        <div class="h-meta" id="chat-meta"></div>
+      </div>
+      <div class="header-actions">
+        <button class="btn-icon" id="btn-stop-header" onclick="stopGeneration()" disabled title="终止当前推理（推理进行中时才可用）">
+          ⏹ 停止推理
+        </button>
+        <button class="btn-icon" onclick="resetCurrentSession()" title="清空本轮对话记录">
+          🔄 重置对话
+        </button>
+        <button class="btn-icon danger" onclick="deleteCurrentSession()" title="删除此会话">
+          🗑 删除
+        </button>
+      </div>
+    </div>
+
+    <!-- 消息列表 -->
+    <div id="messages">
+      <div id="empty-state">
+        <div class="big-icon">💬</div>
+        <p>创建一个新会话，然后开始对话吧</p>
+      </div>
+    </div>
+
+    <!-- 输入区 -->
+    <div id="input-area">
+      <div id="input-row">
+        <textarea id="input-textarea" rows="1" placeholder="输入消息… (Ctrl+Enter 发送)"
+          oninput="autoResize(this)" onkeydown="handleKey(event)"></textarea>
+        <button id="btn-send" onclick="sendMessage()" disabled>发送</button>
+        <button id="btn-stop" onclick="stopGeneration()">停止</button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ===== 右侧：参数配置面板 ===== -->
+  <div id="params-panel">
+    <h2>⚙ 配置</h2>
+
+    <!-- 模型切换 -->
+    <div class="params-section">
+      <h3>模型</h3>
+      <div class="param-row">
+        <label>当前模型</label>
+        <select id="param-model" onchange="changeModel()">
+          <option value="">-- 请创建会话 --</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- 系统提示词 -->
+    <div class="params-section">
+      <h3>系统提示词</h3>
+      <div class="param-row">
+        <textarea id="param-system" rows="4" placeholder="可选：在此輸入 System Prompt…"></textarea>
+      </div>
+      <div class="param-row">
+        <small style="color:var(--muted);font-size:11px">对当前会话生效；重置后下一轮使用新值</small>
+      </div>
+    </div>
+
+    <!-- 推理参数 -->
+    <div class="params-section">
+      <h3>推理参数</h3>
+
+      <div class="param-row">
+        <div class="param-label">
+          <span>最大生成长度</span>
+          <span class="val" id="lbl-max-len">256</span>
+        </div>
+        <input type="range" id="param-max-len" min="16" max="2048" step="16" value="256"
+          oninput="document.getElementById('lbl-max-len').textContent=this.value" />
+      </div>
+
+      <div class="param-row">
+        <div class="param-label">
+          <span>Temperature</span>
+          <span class="val" id="lbl-temperature">0.70</span>
+        </div>
+        <input type="range" id="param-temperature" min="0" max="2" step="0.05" value="0.7"
+          oninput="document.getElementById('lbl-temperature').textContent=parseFloat(this.value).toFixed(2)" />
+      </div>
+
+      <div class="param-row">
+        <div class="param-label">
+          <span>Top-P</span>
+          <span class="val" id="lbl-top-p">0.90</span>
+        </div>
+        <input type="range" id="param-top-p" min="0" max="1" step="0.05" value="0.9"
+          oninput="document.getElementById('lbl-top-p').textContent=parseFloat(this.value).toFixed(2)" />
+      </div>
+
+      <div class="param-row">
+        <div class="param-label">
+          <span>Top-K</span>
+          <span class="val" id="lbl-top-k">40</span>
+        </div>
+        <input type="range" id="param-top-k" min="1" max="200" step="1" value="40"
+          oninput="document.getElementById('lbl-top-k').textContent=this.value" />
+      </div>
+
+      <div class="param-row">
+        <div class="param-label">
+          <span>重复惩罚</span>
+          <span class="val" id="lbl-penalty">1.10</span>
+        </div>
+        <input type="range" id="param-penalty" min="1" max="2" step="0.05" value="1.1"
+          oninput="document.getElementById('lbl-penalty').textContent=parseFloat(this.value).toFixed(2)" />
+      </div>
+    </div>
+
+    <!-- 推理设备 -->
+    <div class="params-section">
+      <h3>推理设备</h3>
+      <div class="param-row">
+        <label>计算设备</label>
+        <div class="device-btn-group">
+          <button class="device-btn active" id="dev-cpu" onclick="selectDevice('cpu')">
+            🖥 CPU
+            <span class="dev-badge">已就绪</span>
+          </button>
+          <button class="device-btn" id="dev-gpu" disabled title="GPU 加速支持开发中">
+            🎮 GPU
+            <span class="dev-badge">暂不支持</span>
+          </button>
+        </div>
+      </div>
+      <div class="param-row" id="cpu-options">
+        <label>Prefill 后端</label>
+        <select id="param-backend">
+          <option value="gemm">GEMM（推荐，速度更快）</option>
+          <option value="tiled">Tiled（默认）</option>
+        </select>
+      </div>
+      <div class="param-row">
+        <div class="param-label">
+          <span>CPU 线程数</span>
+          <span class="val" id="lbl-threads">5</span>
+        </div>
+        <input type="range" id="param-threads" min="1" max="16" step="1" value="5"
+          oninput="document.getElementById('lbl-threads').textContent=this.value" />
+        <small style="color:var(--muted);font-size:11px;margin-top:4px;display:block">新会话创建后生效</small>
+      </div>
+    </div>
+
+    <!-- 统计信息 -->
+    <div class="params-section">
+      <h3>统计</h3>
+      <div class="stat-row"><span class="stat-key">已生成 tokens</span><span class="stat-val" id="stat-tokens">0</span></div>
+      <div class="stat-row"><span class="stat-key">生成速度</span><span class="stat-val" id="stat-speed">— tok/s</span></div>
+      <div class="stat-row"><span class="stat-key">上次耗时</span><span class="stat-val" id="stat-time">—</span></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ===== 新建会话 模态框 ===== -->
+<div id="modal-overlay" onclick="closeModalIfBg(event)">
+  <div id="modal">
+    <h2>✨ 新建会话</h2>
+    <div class="form-row">
+      <label>选择模型</label>
+      <select id="new-model-select">
+        <option value="">加载中……</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label>会话名称（可选）</label>
+      <input type="text" id="new-session-name" placeholder="如：代码助手、写作助手……" />
+    </div>
+    <div class="form-row">
+      <label>系统提示词（可选）</label>
+      <textarea id="new-system-prompt" rows="4"
+        placeholder="如：You are a helpful assistant. 请用中文回答。"></textarea>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-secondary" onclick="closeModal()">取消</button>
+      <button class="btn-primary" onclick="createSession()">创建</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Toast 提示 ===== -->
+<div id="toast"></div>
+
+<script>
+// ===========================================================================
+//  全局状态
+// ===========================================================================
+/** 所有会话，key 为 session_id（数字），value 为本地会话元数据 */
+const sessions = {};
+/** 当前激活的会话 ID */
+let activeSessionId = null;
+/** 每个会话的消息历史，key 为 session_id */
+const msgHistory = {};
+/** 每个会话独立的输入草稿，key 为 session_id */
+const draftInput = {};
+/** 可用模型列表 */
+let availableModels = [];
+/** 本次推理的 EventSource */
+let currentEventSource = null;
+/** 累计生成 token 数（统计） */
+let totalTokensThisSession = 0;
+
+// ===========================================================================
+//  初始化
+// ===========================================================================
+async function init() {
+  // 恢复上次的主题偏好
+  try {
+    const saved = localStorage.getItem('lmrs-theme');
+    if (saved === 'light') {
+      document.documentElement.setAttribute('data-theme', 'light');
+      document.getElementById('btn-theme').textContent = '🌙';
+    }
+  } catch(_) {}
+  await loadModels();
+  await refreshSessions();
+  // 将系统提示的编辑同步到会话对象，避免切换时丢失
+  const ps = document.getElementById('param-system');
+  if (ps) {
+    ps.addEventListener('input', (e) => {
+      if (activeSessionId && sessions[activeSessionId]) {
+        sessions[activeSessionId].system_prompt = e.target.value;
+      }
+    });
+  }
+}
+
+/** 加载可用模型列表 */
+async function loadModels() {
+  try {
+    const resp = await fetch('/api/models');
+    const data = await resp.json();
+    availableModels = data.models || [];
+    const sel = document.getElementById('new-model-select');
+    sel.innerHTML = availableModels.length
+      ? availableModels.map(m => `<option value="${esc(m.name)}">${esc(m.name)} (${esc(m.backend)})</option>`).join('')
+      : '<option value="">无可用模型</option>';
+  } catch (e) {
+    showToast('加载模型列表失败: ' + e.message, 'error');
+  }
+}
+
+/** 刷新服务器上的会话列表 */
+async function refreshSessions() {
+  try {
+    const resp = await fetch('/api/sessions');
+    const data = await resp.json();
+    for (const s of (data.sessions || [])) {
+      if (!sessions[s.id]) {
+        sessions[s.id] = { ...s, name: '会话 #' + s.id };
+        msgHistory[s.id] = [];
+      } else {
+        // 合并服务器返回信息，但保留客户端本地的 system_prompt（若已设置）
+        sessions[s.id].model_name = s.model_name;
+        sessions[s.id].is_first_turn = s.is_first_turn;
+        sessions[s.id].generating = s.generating;
+        if (!sessions[s.id].system_prompt) sessions[s.id].system_prompt = s.system_prompt;
+      }
+    }
+    renderSidebar();
+  } catch (_) {}
+}
+
+// ===========================================================================
+//  会话管理
+// ===========================================================================
+
+/** 打开新建会话模态框 */
+function openNewSessionModal() {
+  // ★ 不再异步调用 loadModels（会产生竞态，导致 select.value 被重置）
+  //   直接用已缓存的 availableModels 同步填充 select
+  const sel = document.getElementById('new-model-select');
+  sel.innerHTML = availableModels.length
+    ? availableModels.map(m => `<option value="${esc(m.name)}">${esc(m.name)} (${esc(m.backend)})</option>`).join('')
+    : '<option value="">无可用模型</option>';
+  document.getElementById('new-session-name').value = '';
+  document.getElementById('new-system-prompt').value = '';
+  document.getElementById('modal-overlay').classList.add('show');
+}
+
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('show');
+}
+
+function closeModalIfBg(e) {
+  if (e.target === document.getElementById('modal-overlay')) closeModal();
+}
+
+/** 创建新会话 */
+async function createSession() {
+  const modelName = document.getElementById('new-model-select').value;
+  // 如果新建模态中没有选中任何模型，尝试回退到参数面板选中的模型或第一个可用模型
+  let effectiveModel = modelName;
+  if (!effectiveModel) {
+    const fallback = document.getElementById('param-model')?.value || (availableModels[0] && availableModels[0].name) || '';
+    effectiveModel = fallback;
+  }
+  const name = document.getElementById('new-session-name').value.trim();
+  const systemPrompt = document.getElementById('new-system-prompt').value;
+
+  if (!effectiveModel) { showToast('请选择一个模型', 'error'); return; }
+
+  try {
+    const resp = await fetch('/api/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model_name: effectiveModel, system_prompt: systemPrompt }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json();
+      showToast(err.error || '创建失败', 'error');
+      return;
+    }
+    const data = await resp.json();
+    const sid = data.session_id;
+    sessions[sid] = {
+      id: sid,
+      model_name: effectiveModel,
+      system_prompt: systemPrompt,
+      is_first_turn: true,
+      generating: false,
+      name: name || ('会话 #' + sid),
+    };
+    msgHistory[sid] = [];
+    draftInput[sid] = '';
+    closeModal();
+    renderSidebar();
+    switchSession(sid);
+    showToast('会话已创建', 'success');
+  } catch (e) {
+    showToast('网络错误: ' + e.message, 'error');
+  }
+}
+
+/** 切换到指定会话 */
+function switchSession(sid) {
+  if (!sessions[sid]) return; // 防御：会话对象不存在时不处理
+
+  // ★ 离开当前会话前，把输入框内容保存到该会话的草稿
+  if (activeSessionId !== null && activeSessionId !== sid) {
+    const ta = document.getElementById('input-textarea');
+    draftInput[activeSessionId] = ta ? ta.value : '';
+  }
+
+  activeSessionId = sid;
+  const s = sessions[sid];
+  totalTokensThisSession = 0;
+
+  // 更新顶部标题
+  document.getElementById('chat-title').textContent = s.name;
+  document.getElementById('chat-meta').textContent = `模型：${s.model_name}`;
+
+  // 同步参数面板
+  document.getElementById('param-system').value = s.system_prompt || '';
+  syncModelDropdown(s.model_name);
+
+  // ★ 恢复该会话的输入草稿
+  const ta = document.getElementById('input-textarea');
+  if (ta) {
+    ta.value = draftInput[sid] || '';
+    ta.style.height = 'auto';
+    if (ta.value) ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
+  }
+
+  // 重渲染侧边栏高亮
+  renderSidebar();
+
+  // ★ 渲染消息历史（若会话正在生成中，renderMessages 会显示目前已保存的片段）
+  renderMessages(sid);
+
+  // 更新按钮状态（只看当前会话是否在生成）
+  updateSendButtons();
+}
+
+/** 更新参数面板的模型下拉框 */
+function syncModelDropdown(selectedName) {
+  const sel = document.getElementById('param-model');
+  sel.innerHTML = availableModels.map(m =>
+    `<option value="${esc(m.name)}" ${m.name === selectedName ? 'selected' : ''}>${esc(m.name)} (${esc(m.backend)})</option>`
+  ).join('');
+}
+
+/** 切换模型（在参数面板中） */
+async function changeModel() {
+  if (!activeSessionId) return;
+  const newModel = document.getElementById('param-model').value;
+  if (!newModel || sessions[activeSessionId]?.model_name === newModel) return;
+
+  // 需要重置会话才能切换模型（kvcache与模型绑定）
+  const ok = await resetSession(activeSessionId, true);
+  if (ok) {
+    sessions[activeSessionId].model_name = newModel;
+    // 在服务器端删除旧会话并重建
+    try {
+      await fetch('/api/sessions/' + activeSessionId, { method: 'DELETE' });
+      const resp = await fetch('/api/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model_name: newModel,
+          system_prompt: sessions[activeSessionId].system_prompt || '',
+        }),
+      });
+      const data = await resp.json();
+      const oldSid = activeSessionId;
+      const newSid = data.session_id;
+      sessions[newSid] = { ...sessions[oldSid], id: newSid, model_name: newModel };
+      msgHistory[newSid] = msgHistory[oldSid] || [];
+      delete sessions[oldSid];
+      delete msgHistory[oldSid];
+      activeSessionId = newSid;
+      renderSidebar();
+      switchSession(newSid);
+      showToast('已切换到模型: ' + newModel, 'success');
+    } catch (e) {
+      showToast('切换模型失败: ' + e.message, 'error');
+    }
+  }
+}
+
+/** 重置当前会话对话记录 */
+async function resetCurrentSession() {
+  if (!activeSessionId) return;
+  await resetSession(activeSessionId, false);
+}
+
+/** 重置某会话（silent=true 时不弹确认） */
+async function resetSession(sid, silent) {
+  if (!silent) {
+    if (!confirm('确认清空此会话的对话历史？')) return false;
+  }
+  try {
+    const resp = await fetch(`/api/sessions/${sid}/reset`, { method: 'POST' });
+    if (!resp.ok) {
+      const err = await resp.json();
+      showToast(err.error || '重置失败', 'error');
+      return false;
+    }
+    msgHistory[sid] = [];
+    if (sessions[sid]) sessions[sid].is_first_turn = true;
+    if (sid === activeSessionId) renderMessages(sid);
+    if (!silent) showToast('对话已重置', 'success');
+    return true;
+  } catch (e) {
+    showToast('网络错误: ' + e.message, 'error');
+    return false;
+  }
+}
+
+/** 删除当前会话 */
+async function deleteCurrentSession() {
+  if (!activeSessionId) return;
+  if (!confirm('确认删除此会话？')) return;
+  const sid = activeSessionId;
+  try {
+    await fetch(`/api/sessions/${sid}`, { method: 'DELETE' });
+  } catch (_) {}
+  delete sessions[sid];
+  delete msgHistory[sid];
+  activeSessionId = null;
+  renderSidebar();
+  renderMessages(null);
+  document.getElementById('chat-title').textContent = '请先创建一个会话';
+  document.getElementById('chat-meta').textContent = '';
+  document.getElementById('btn-send').disabled = true;
+  showToast('会话已删除', 'success');
+}
+
+// ===========================================================================
+//  消息渲染
+// ===========================================================================
+
+/** 渲染侧边栏会话列表 */
+function renderSidebar() {
+  const list = document.getElementById('session-list');
+  const ids = Object.keys(sessions).map(Number).sort((a, b) => a - b);
+  if (ids.length === 0) {
+    list.innerHTML = '<div style="padding:16px;color:var(--muted);font-size:12px;text-align:center">暂无会话</div>';
+    return;
+  }
+  list.innerHTML = ids.map(sid => {
+    const s = sessions[sid];
+    const isActive = sid === activeSessionId;
+    const isGen = s.generating;
+    return `
+    <div class="session-item ${isActive ? 'active' : ''}" onclick="switchSession(${sid})">
+      <div class="s-name">${isGen ? '<span class="s-badge"></span>' : ''}${esc(s.name)}</div>
+      <div class="s-model">${esc(s.model_name)}</div>
+      <span class="s-del" onclick="deleteSessionById(event,${sid})">✕</span>
+    </div>`;
+  }).join('');
+}
+
+async function deleteSessionById(e, sid) {
+  e.stopPropagation();
+  if (!confirm('确认删除会话 "' + (sessions[sid]?.name || sid) + '"？')) return;
+  try { await fetch('/api/sessions/' + sid, { method: 'DELETE' }); } catch (_) {}
+  delete sessions[sid];
+  delete msgHistory[sid];
+  if (activeSessionId === sid) {
+    activeSessionId = null;
+    document.getElementById('chat-title').textContent = '请先创建一个会话';
+    document.getElementById('chat-meta').textContent = '';
+    document.getElementById('btn-send').disabled = true;
+    renderMessages(null);
+  }
+  renderSidebar();
+  showToast('已删除', 'success');
+}
+
+/** 渲染聊天消息区 */
+function renderMessages(sid) {
+  const container = document.getElementById('messages');
+  if (!sid || !msgHistory[sid] || msgHistory[sid].length === 0) {
+    container.innerHTML = `
+      <div id="empty-state">
+        <div class="big-icon">💬</div>
+        <p>${sid ? '开始你的对话吧' : '创建一个新会话，然后开始对话吧'}</p>
+      </div>`;
+    return;
+  }
+  container.innerHTML = msgHistory[sid].map((m, i) => buildMsgHTML(m, i, sid)).join('');
+  scrollToBottom();
+}
+
+/** 构建单条消息的HTML */
+function buildMsgHTML(msg, idx, sid) {
+  const isUser = msg.role === 'user';
+  const avatar = isUser ? 'U' : 'AI';
+  const statHtml = msg.stats
+    ? `<div class="msg-meta">${msg.stats}</div>`
+    : '';
+  return `
+    <div class="msg ${msg.role}" data-idx="${idx}">
+      <div class="msg-avatar">${avatar}</div>
+      <div class="msg-body">
+        <div class="msg-bubble" id="msg-bubble-${sid}-${idx}">${escHtml(msg.content)}</div>
+        ${statHtml}
+      </div>
+    </div>`;
+}
+
+/** 添加消息到历史并渲染 */
+function addMessage(sid, role, content, stats) {
+  if (!msgHistory[sid]) msgHistory[sid] = [];
+  msgHistory[sid].push({ role, content, stats: stats || null });
+  const idx = msgHistory[sid].length - 1;
+
+  // ★ 只有当前正在显示该会话时才操作 DOM
+  //   其他情况只更新数据，等用户切回时 renderMessages 会完整重建
+  if (sid === activeSessionId) {
+    const container = document.getElementById('messages');
+    const empty = document.getElementById('empty-state');
+    if (empty) empty.remove();
+    const div = document.createElement('div');
+    div.innerHTML = buildMsgHTML({ role, content, stats: stats || null }, idx, sid);
+    container.appendChild(div.firstElementChild);
+    scrollToBottom();
+  }
+  return idx;
+}
+
+/** 更新正在流式输出的 assistant 消息气泡 */
+function updateStreamingBubble(sid, idx, text, finished) {
+  // ★ 关键：无论 DOM 是否可见，都先把内容持久化到 msgHistory
+  //   切换会话后再切回时 renderMessages 会重新构建 DOM，必须保证数据已经存在
+  if (msgHistory[sid] && msgHistory[sid][idx] !== undefined) {
+    msgHistory[sid][idx].content = text || '';
+  }
+
+  const bubble = document.getElementById('msg-bubble-' + sid + '-' + idx);
+  if (!bubble) return; // 当前不在该会话视图，数据已保存，DOM 等切回时 renderMessages 重建
+
+  if (!finished && (text === '' || text === undefined || text === null)) {
+    // 尚未收到第一个字符，显示思考动画
+    bubble.innerHTML = '<span class="thinking-dots"><span></span><span></span><span></span></span>';
+  } else {
+    bubble.innerHTML = escHtml(text || '') + (finished ? '' : '<span class="streaming-cursor"></span>');
+  }
+  scrollToBottom();
+}
+
+function scrollToBottom() {
+  const c = document.getElementById('messages');
+  c.scrollTop = c.scrollHeight;
+}
+
+// ===========================================================================
+//  推理（发送消息）
+// ===========================================================================
+
+/** 处理输入框键盘事件：Ctrl+Enter 发送 */
+function handleKey(e) {
+  if (e.key === 'Enter' && e.ctrlKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+}
+
+/** 自动调整输入框高度 */
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+}
+
+/** 更新发送/停止按钮状态 */
+function updateSendButtons(generating) {
+  const sendBtn = document.getElementById('btn-send');
+  const stopBtn = document.getElementById('btn-stop');
+  const stopHeader = document.getElementById('btn-stop-header');
+
+  // ★ 只看当前会话是否在推理，支持真正并行：其他会话推理中不影响本会话的发送
+  const curGenerating = !!generating ||
+    (activeSessionId !== null && sessions[activeSessionId]?.generating === true);
+
+  sendBtn.disabled = !activeSessionId || curGenerating;
+  sendBtn.style.display = curGenerating ? 'none' : '';
+  stopBtn.style.display = curGenerating ? '' : 'none';
+
+  // 标题栏停止按钮仅在当前会话推理时启用
+  if (stopHeader) {
+    stopHeader.disabled = !curGenerating;
+  }
+}
+
+/** 切换推理设备（目前仅 CPU 可用） */
+function selectDevice(device) {
+  document.getElementById('dev-cpu').classList.toggle('active', device === 'cpu');
+  document.getElementById('cpu-options').style.display = device === 'cpu' ? '' : 'none';
+}
+
+/** 发送消息，启动流式推理 */
+async function sendMessage() {
+  if (!activeSessionId) return;
+  const textarea = document.getElementById('input-textarea');
+  const text = textarea.value.trim();
+  if (!text) return;
+
+  const sid = activeSessionId;
+
+  // 读取当前面板中的参数（每一轮都可以独立调整）
+  const params = {
+    message: text,
+    max_len: parseInt(document.getElementById('param-max-len').value),
+    temperature: parseFloat(document.getElementById('param-temperature').value),
+    top_p: parseFloat(document.getElementById('param-top-p').value),
+    top_k: parseInt(document.getElementById('param-top-k').value),
+    penalty: parseFloat(document.getElementById('param-penalty').value),
+    // 将最新的 system prompt 随每次请求传过去（重置前生效）
+    system_prompt: document.getElementById('param-system').value,
+    // 推理设备与后端
+    prefill_backend: document.getElementById('param-backend').value,
+    threads: parseInt(document.getElementById('param-threads').value),
+  };
+
+  // 清空输入框，并同步清空该会话的草稿
+  textarea.value = '';
+  textarea.style.height = 'auto';
+  draftInput[sid] = '';
+
+  // 添加用户消息气泡
+  addMessage(sid, 'user', text);
+
+  // 添加 assistant 占位气泡，立即显示等待动画
+  const assistantIdx = addMessage(sid, 'assistant', '');
+  updateStreamingBubble(sid, assistantIdx, '', false);
+
+  // 更新UI状态
+  // 将当前面板的 system_prompt 存回会话，用于保持一致性
+  if (sessions[sid]) {
+    sessions[sid].system_prompt = params.system_prompt;
+    sessions[sid].generating = true;
+  }
+  updateSendButtons(true);
+  renderSidebar();
+
+  // 通过 SSE 发起流式推理
+  let buffer = '';
+  let tokenCount = 0;
+  const startMs = Date.now();
+
+  try {
+    const response = await fetch(`/api/sessions/${sid}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ error: '未知错误' }));
+      updateStreamingBubble(sid, assistantIdx, '⚠ ' + (err.error || '推理失败'), true);
+      finishGeneration(sid, assistantIdx, buffer, null);
+      return;
+    }
+
+    // 逐行读取 SSE 流
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let partial = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      partial += decoder.decode(value, { stream: true });
+
+      // 按 \n\n 分割SSE事件
+      const events = partial.split('\n\n');
+      partial = events.pop(); // 最后一段可能不完整，保留
+
+      for (const event of events) {
+        if (!event.startsWith('data:')) continue;
+        const jsonStr = event.replace(/^data:\s*/, '');
+        try {
+          const msg = JSON.parse(jsonStr);
+          if (msg.type === 'token') {
+            buffer = msg.text;   // 服务端发来的是全量累积文本，直接替换
+            tokenCount++;
+            updateStreamingBubble(sid, assistantIdx, buffer, false);
+            // ★ 只在当前显示此会话时才更新统计面板，避免污染其他会话的数据
+            if (sid === activeSessionId) {
+              const elapsed = (Date.now() - startMs) / 1000;
+              document.getElementById('stat-tokens').textContent = tokenCount;
+              document.getElementById('stat-speed').textContent =
+                elapsed > 0 ? (tokenCount / elapsed).toFixed(1) + ' tok/s' : '—';
+            }
+          } else if (msg.type === 'done') {
+            const stats = `${msg.tokens_generated} tokens · ${(msg.elapsed_ms/1000).toFixed(2)}s · ${msg.tokens_per_sec.toFixed(1)} tok/s${msg.cancelled ? ' · 已取消' : ''}`;
+            finishGeneration(sid, assistantIdx, msg.full_text || buffer, stats);
+            // ★ 只在当前显示此会话时才更新统计面板，避免 totalTokensThisSession 被后台会话污染
+            if (sid === activeSessionId) {
+              document.getElementById('stat-time').textContent = (msg.elapsed_ms/1000).toFixed(2) + 's';
+              totalTokensThisSession += msg.tokens_generated;
+              document.getElementById('stat-tokens').textContent = totalTokensThisSession;
+              document.getElementById('stat-speed').textContent = msg.tokens_per_sec.toFixed(1) + ' tok/s';
+            }
+          }
+        } catch (_) {}
+      }
+    }
+  } catch (e) {
+    if (sessions[sid]?.generating) {
+      // 只有推理真正在进行时才显示错误
+      updateStreamingBubble(sid, assistantIdx, '⚠ 推理中断: ' + e.message, true);
+      finishGeneration(sid, assistantIdx, '', null);
+    }
+  }
+}
+
+/** 推理结束后恢复UI状态 */
+function finishGeneration(sid, assistantIdx, finalText, stats) {
+  if (sessions[sid]) sessions[sid].generating = false;
+
+  // updateStreamingBubble 会先把 content 写入 msgHistory，再更新 DOM（如可见）
+  updateStreamingBubble(sid, assistantIdx, finalText || '（无内容）', true);
+
+  // 把 stats 写入 msgHistory，下次 renderMessages 时会自动渲染
+  if (stats && msgHistory[sid] && msgHistory[sid][assistantIdx] !== undefined) {
+    msgHistory[sid][assistantIdx].stats = stats;
+  }
+
+  // 如果会话当前可见，直接往 DOM 里追加统计行（避免整页重渲染的闪烁）
+  if (stats) {
+    const bubble = document.getElementById('msg-bubble-' + sid + '-' + assistantIdx);
+    if (bubble) {
+      const msgEl = bubble.closest('.msg');
+      const bodyEl = msgEl?.querySelector('.msg-body');
+      if (bodyEl) {
+        let metaEl = bodyEl.querySelector('.msg-meta');
+        if (!metaEl) {
+          metaEl = document.createElement('div');
+          metaEl.className = 'msg-meta';
+          bodyEl.appendChild(metaEl);
+        }
+        metaEl.textContent = stats;
+      }
+    }
+  }
+
+  updateSendButtons(false);
+  renderSidebar();
+
+  // ★ 如果会话当前可见且刚完成，刷新消息区以确保 DOM 和 history 完全同步
+  //   （兜底：防止任何边缘情况导致气泡内容不一致）
+  if (sid === activeSessionId) {
+    // 只有在 DOM 中找不到气泡时才全量重渲染（正常情况 bubble 存在，无需重渲染)
+    const bubble = document.getElementById('msg-bubble-' + sid + '-' + assistantIdx);
+    if (!bubble) {
+      renderMessages(sid);
+    }
+  }
+}
+
+/** 停止当前会话的推理 */
+async function stopGeneration() {
+  // ★ 只停止当前可见会话，不影响其他正在推理的会话
+  if (!activeSessionId) return;
+  try {
+    await fetch(`/api/sessions/${activeSessionId}/stop`, { method: 'POST' });
+    showToast('已发送停止指令', 'success');
+  } catch (e) {
+    showToast('停止失败: ' + e.message, 'error');
+  }
+}
+
+/** 白天/黑夜模式切换 */
+function toggleTheme() {
+  const html = document.documentElement;
+  const isLight = html.getAttribute('data-theme') === 'light';
+  const newTheme = isLight ? 'dark' : 'light';
+  html.setAttribute('data-theme', newTheme);
+  document.getElementById('btn-theme').textContent = newTheme === 'light' ? '🌙' : '☀️';
+  try { localStorage.setItem('lmrs-theme', newTheme); } catch(_) {}
+}
+
+// ===========================================================================
+//  工具函数
+// ===========================================================================
+
+/** HTML转义，防止XSS */
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** HTML attribute转义 */
+function esc(str) {
+  return String(str || '').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+/** 显示 Toast 通知 */
+function showToast(msg, type) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show' + (type ? ' ' + type : '');
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => { el.className = ''; }, 3000);
+}
+
+// ===========================================================================
+//  启动
+// ===========================================================================
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>

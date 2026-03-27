@@ -383,3 +383,177 @@ release 连续口径最新摘要：
 结论：
 - 本轮所有阶段均已落地并完成 release 验证。
 - 目前仍未达到 `80%` 目标，主要差距仍在 prefill 主路径；后续应继续优先推进量化投影与长期复用相关优化。
+
+---
+
+## 2026-03-27 基于 llama.cpp 源码的全面根因分析与优化规划
+
+### 一、基准对照（本轮测量）
+
+| 指标 | 我方 | llama.cpp | 比率 |
+|------|------|-----------|------|
+| prefill tok/s | 11.4 | ~484 | 0.0241 |
+| decode tok/s | 6.90 | ~58 | 0.12 |
+
+### 二、llama.cpp CPU 主路径源码分析总结
+
+经逐文件分析 `ggml-cpu.c`（125KB）、`ggml-cpu.cpp`（24KB）、`ops.cpp`（382KB）、`quants.c`（42KB）、`arch/x86/quants.c`（x86 AVX2 内核）、`simd-gemm.h`（4KB），llama.cpp 的 CPU 推理主路径结构如下：
+
+#### 2.1 线程池架构（`ggml-cpu.c`）
+- **持久化线程池**：`ggml_threadpool` 在启动时创建所有工作线程（`ggml_graph_compute_secondary_thread`），线程一直存活直到 threadpool 销毁。
+- **轻量同步**：使用 `ggml_barrier()` 做 atomic spin-wait + seq_cst fence 同步，无 mutex 开销。
+- **混合等待**：工作线程在无新图时先 spin-poll（`poll` 参数控制轮数，默认 128K 轮），超时后退化到 condvar sleep。
+- **图执行**：`ggml_graph_compute_thread()` 遍历 `cgraph->nodes[]`，对每个 node 调用 `ggml_compute_forward()`，节点间用 `ggml_barrier()` 同步。
+- **无需 per-op 线程创建/销毁**：对比我方 Rayon per-op spawn，llama.cpp 的线程池零创建开销。
+
+#### 2.2 mul_mat 三级分发（`ggml-cpu.c` 中的 `ggml_compute_forward_mul_mat`）
+1. **第一级：llamafile SGEMM**（`GGML_USE_LLAMAFILE` 编译开关）
+   - 先用 raw src1（f32）尝试 `llamafile_sgemm(ne01, ne11, ne00/blck_size, src0, src1, dst, src0->type, src1->type, dst->type)`。
+   - llamafile_sgemm 可以直接在 Q4_K × f32 上做 BLAS 风格 tiled GEMM，无需预先量化激活。
+   - 成功则直接 return，完全绕过 vec_dot 路径。
+
+2. **第二级：激活量化 + llamafile SGEMM**
+   - 若第一级失败（不支持该 type 组合），先用 `from_float` 将 f32 激活量化到 `vec_dot_type`（如 Q4_K → Q8_K）。
+   - 量化并行：每个线程负责 `ne10` 的 `[ith*ne10/(bs*nth), (ith+1)*ne10/(bs*nth))` 区间。
+   - `ggml_barrier()` 后，再尝试一次 `llamafile_sgemm(src0, wdata, dst, src0->type, vec_dot_type, dst->type)`。
+   - 成功则 return。
+
+3. **第三级：work-stealing 分块 vec_dot**
+   - 输出空间 `(nr0, nr1)` 被分成 chunk_size=16 的块（nr0=1 或 nr1=1 时用 64）。
+   - `nchunk0 * nchunk1` 个工作块，每个线程从 chunk `ith` 开始，完成后用 `atomic_fetch_add(&current_chunk, 1)` 抢下一块。
+   - 对 NUMA 或块数不足时回退：`nchunk0 = nr0>nr1 ? nth : 1`（静态行/列分区）。
+   - 每块调用 `ggml_compute_forward_mul_mat_one_chunk()`：16×16 块平铺，内层调 `vec_dot(ne00, &tmp[...], src0_row + ir0*nb01, src1_col, num_rows_per_vec_dot)`。
+   - `vec_dot` 对 Q4_K 是 `ggml_vec_dot_q4_K_q8_K`（在 `arch/x86/quants.c` 中，用 `_mm256_maddubs_epi16 + _mm256_madd_epi16` AVX2 优化）。
+
+#### 2.3 vec_dot 内核（`arch/x86/quants.c`）
+- `ggml_vec_dot_q4_K_q8_K`：一次处理一整行（ne00 个元素），每 256 元素块（Q4_K block = 144 bytes）用 AVX2：
+  - 加载 Q4K 的 4-bit nibble，用 `_mm256_and_si256 + _mm256_srli_epi16` 分离高低 4 位。
+  - `_mm256_maddubs_epi16(q4_bytes, q8_bytes)` 做 unsigned×signed 8-bit 乘加。
+  - `_mm256_madd_epi16(..., ones)` 水平求和到 i32。
+  - 带 6-bit scale/min 精确还原，最终 `hsum` 累加到 f32。
+- 对比我方 `q4k_decode_block_dot_q8k_avx2`：结构类似，但需要确认是否完全对齐（特别是 scale 处理和循环展开）。
+
+#### 2.4 simd_gemm（`simd-gemm.h`）
+- 纯 f32 SIMD GEMM，仅用于 `flash_attn_ext` 的 tiled prefill 路径。
+- AVX2 配置：GEMM_RM=6, GEMM_RN=2, KN=8 → 6×16 输出 tile。
+- 使用 `GGML_F32_VEC_FMA` 做 FMA 累加，`GGML_F32_VEC_SET1` 广播 A 元素。
+- **不用于主 matmul 路径**，仅用于 attention 内部的小矩阵乘法。
+
+#### 2.5 图计划与工作空间（`ggml_graph_plan`）
+- 遍历 cgraph 所有节点，计算最大 `n_tasks` 和 `work_size`。
+- MUL_MAT 的 `n_tasks = n_threads`，`work_size = ggml_row_size(vec_dot_type, ggml_nelements(src1))`（激活量化空间）。
+- 工作空间一次性分配，所有 op 共用同一份 `cplan->work_data`。
+
+#### 2.6 type_traits_cpu 类型分发表（`ggml-cpu.c`）
+```c
+[GGML_TYPE_Q4_K] = {
+    .from_float    = quantize_row_q4_K,       // f32 → Q4_K
+    .vec_dot       = ggml_vec_dot_q4_K_q8_K,  // Q4_K × Q8_K → f32
+    .vec_dot_type  = GGML_TYPE_Q8_K,           // 激活量化目标类型
+    .nrows         = 1,                         // x86 上每次 vec_dot 处理 1 行
+};
+```
+- 所有 K-quant 的 `vec_dot_type` 都是 `GGML_TYPE_Q8_K`。
+- ARM MMLA 上 Q4_K 的 `nrows=2`（一次 vec_dot 处理 2 行）。
+
+### 三、根因对照分析
+
+| # | 根因 | 我方现状 | llama.cpp 做法 | 影响估计 |
+|---|------|----------|---------------|---------|
+| 1 | **线程管理** | Rayon per-op 创建并行任务，每次 matmul 承担 `rayon::join/par_iter` 调度开销 | 持久化线程池 + atomic barrier，零创建开销 | 2-3x（decode 更敏感，每秒执行 ~400+ matmul） |
+| 2 | **prefill matmul 策略** | `LMRS_PREFILL_BACKEND=gemm` 将 Q4_K 解量化为 f32 → `gemm::gemm()` 做 f32 GEMM（4x 内存膨胀） | llamafile_sgemm 直接在 Q4_K×Q8_K 上做 tiled GEMM，无解量化膨胀 | 5-10x（prefill 的主要差距来源） |
+| 3 | **激活量化** | 每次量化 matmul 都重新打包激活面板 | `from_float` 一次性量化到 `vec_dot_type`，barrier 后所有 chunk 共享 | 1.5-2x |
+| 4 | **work-stealing 动态负载均衡** | Rayon work-stealing 有更高的任务粒度开销 | `atomic_fetch_add(&current_chunk)` 极轻量抢活，16×16 块粒度 | 1.2-1.5x |
+| 5 | **vec_dot 内核效率** | 已有 `q4k_decode_block_dot_q8k_avx2`，但需对齐优化水平 | `ggml_vec_dot_q4_K_q8_K` 在 `arch/x86/quants.c` 高度调优 | 1.2-1.5x（decode 瓶颈） |
+| 6 | **图执行 vs 逐操作调度** | 每个 op 单独函数调用，包含权重查询、形状计算、缓冲分配 | `ggml_compute_forward()` 通过预建图顺序执行，最小调度开销 | 1.2-1.5x |
+| 7 | **权重内存布局** | 原始 GGUF 布局直接读取 | `repack.cpp`（196KB）加载期重排权重为 cache-friendly 布局 | 1.2-1.5x（prefill 更敏感） |
+| 8 | **MLP 融合** | gate 和 up 分别调用 matmul，各自承担调度和激活量化开销 | 共享激活量化面板，图执行自然合并调度 | 1.1-1.3x |
+
+### 四、分步优化规划
+
+优先级排序依据：**影响估计 × 实现复杂度的倒数**，优先做高收益低风险的。
+
+#### P1：持久化线程池替代 Rayon per-op 调度（影响 2-3x，decode 重点）
+**目标**：消除每次 matmul 的线程创建/调度开销。
+- [ ] 步骤 1：实现持久化线程池（参考 `ggml_threadpool`），支持 barrier 同步和 atomic chunk 分发。
+- [ ] 步骤 2：替换 `matmul_transb_gguf_quant` 中的 Rayon `par_chunks_mut` 为线程池静态分区 + barrier。
+- [ ] 步骤 3：替换 `matmul_transb` 中 `gemm::gemm` 的 `Parallelism::Rayon` 为线程池并行（若 `gemm` crate 不支持自定义并行，则用线程池做外层行分区）。
+- [ ] 步骤 4：替换 rms_norm / silu / rope 等其他 per-op Rayon 调用。
+- [ ] 步骤 5：5 轮 benchmark 验收（连续 + 交错），确认 decode 与 prefill 都改善。
+- 验收标准：decode 吞吐提升 ≥ 30%。
+
+#### P2：prefill 量化原生 GEMM（影响 5-10x，prefill 重点）
+**目标**：消除 Q4_K → f32 解量化膨胀，直接在量化类型上做 tiled matmul。
+- [ ] 步骤 1：实现 Q4_K × Q8_K 的 tiled GEMM 微内核（参考 llamafile_sgemm 的分块策略），输出 tile 大小建议 6×16（AVX2）。
+- [ ] 步骤 2：prefill matmul 路径改为：先 `from_float` 一次性量化激活到 Q8_K → 调用量化 tiled GEMM。
+- [ ] 步骤 3：为 Q6_K × Q8_K 实现对应 tiled GEMM 微内核。
+- [ ] 步骤 4：禁用 `LMRS_PREFILL_BACKEND=gemm` 的 f32 解量化路径，改为默认走量化原生 GEMM。
+- [ ] 步骤 5：5 轮 benchmark 验收，目标 prefill_ratio ≥ 0.50。
+- 验收标准：prefill 吞吐提升 ≥ 3x。
+
+#### P3：激活量化一次性复用（影响 1.5-2x）
+**目标**：对同一 forward pass 中共享输入的投影（如 Q/K/V 三投影），只量化一次激活。
+- [ ] 步骤 1：在 `forward()` 层级维护 Q8_K 激活缓存，按 `(tensor_ptr, seq_len)` 做 key。
+- [ ] 步骤 2：Q/K/V 三投影共享同一份 Q8_K 激活面板。
+- [ ] 步骤 3：gate/up 双投影共享同一份 Q8_K 激活面板。
+- [ ] 步骤 4：5 轮 benchmark 验收。
+- 验收标准：prefill + decode 均有可测量改善。
+
+#### P4：work-stealing 分块调度（影响 1.2-1.5x）
+**目标**：用 llama.cpp 的 `atomic_fetch_add` 分块策略替代当前静态行分区。
+- [ ] 步骤 1：在持久化线程池中增加 `current_chunk: AtomicU32`。
+- [ ] 步骤 2：matmul work loop 改为 `while current_chunk < total_chunks { ... atomic_fetch_add }` 模式。
+- [ ] 步骤 3：块大小策略：默认 16，nr0=1 或 nr1=1 时用 64。
+- [ ] 步骤 4：5 轮 benchmark 验收。
+
+#### P5：vec_dot 内核对齐（影响 1.2-1.5x，decode 重点）
+**目标**：确保我方 AVX2 vec_dot 内核与 llama.cpp `arch/x86/quants.c` 完全对齐。
+- [ ] 步骤 1：逐行对比 `q4k_decode_block_dot_q8k_avx2` 与 `ggml_vec_dot_q4_K_q8_K`，特别关注 scale/min 处理、循环展开、水平求和。
+- [ ] 步骤 2：实现整行一次性 vec_dot（跨所有 blocks），避免逐块函数调用开销。
+- [ ] 步骤 3：对 Q6_K 做同样的对齐检查和优化。
+- [ ] 步骤 4：5 轮 benchmark 验收。
+
+#### P6：加载期权重重排（影响 1.2-1.5x，prefill 重点）
+**目标**：参考 `repack.cpp`，在 GGUF 加载时将权重重排为计算友好布局。
+- [ ] 步骤 1：分析 `repack.cpp` 中 Q4_K/Q6_K 的重排目标布局。
+- [ ] 步骤 2：在 GGUF 加载阶段实现重排，生成 `prefill_packed` 主布局。
+- [ ] 步骤 3：让 vec_dot/GEMM 微内核直接消费重排后的布局，绕开运行时 scale/min 解析。
+- [ ] 步骤 4：5 轮 benchmark 验收。
+
+#### P7：图执行减少调度开销（影响 1.2-1.5x）
+**目标**：减少 per-op 的调度、形状计算和缓冲分配开销。
+- [ ] 步骤 1：预分配所有中间缓冲（参考 `ggml_graph_plan` 的 `work_size` 策略），消除 per-op 堆分配。
+- [ ] 步骤 2：缓存权重查找结果（当前每次 matmul 都查 HashMap）。
+- [ ] 步骤 3：评估是否引入轻量图表示，提前规划所有 op 的执行顺序和参数。
+- [ ] 步骤 4：5 轮 benchmark 验收。
+
+#### P8：MLP gate/up 投影融合（影响 1.1-1.3x）
+**目标**：gate 和 up 共享激活量化和调度。
+- [ ] 步骤 1：实现 `matmul_transb_weight_batch2_fused`：一次量化激活 → 同时计算 gate 和 up 的输出。
+- [ ] 步骤 2：在持久化线程池下评估是否做 gate/up/down 三投影流水线。
+- [ ] 步骤 3：5 轮 benchmark 验收。
+
+### 五、预期收益估算
+
+| 阶段 | 预期改善倍数 | 累积后 prefill_ratio | 累积后 decode_ratio |
+|------|-------------|---------------------|---------------------|
+| 当前基线 | 1.0x | 0.23 | 0.43 |
+| P1（线程池） | 1.5-2x decode, 1.3x prefill | 0.30 | 0.65-0.86 |
+| P2（量化 GEMM） | 3-5x prefill | 0.90-1.50 | 0.65-0.86 |
+| P3（激活复用） | 1.2-1.5x | + | + |
+| P4-P8 | 1.1-1.3x 叠加 | ≥ 0.80 | ≥ 0.80 |
+
+**关键结论**：P1 和 P2 是最高优先级，合并后预计可将 prefill_ratio 从 0.23 推到 ≥ 0.60，decode_ratio 从 0.43 推到 ≥ 0.65。后续 P3-P8 的叠加效应可进一步推到 ≥ 0.80。
+
+### 六、参考文件路径（llama.cpp 源码）
+
+| 文件 | 关键内容 |
+|------|---------|
+| `ggml/src/ggml-cpu/ggml-cpu.c` | `ggml_compute_forward_mul_mat`、线程池、barrier、`type_traits_cpu` |
+| `ggml/src/ggml-cpu/ggml-cpu.cpp` | 后端注册、graph 执行入口 |
+| `ggml/src/ggml-cpu/ops.cpp` | 所有非 mul_mat 算子（rms_norm, rope, flash_attn_ext 等） |
+| `ggml/src/ggml-cpu/arch/x86/quants.c` | AVX2/AVX512 vec_dot 优化内核 |
+| `ggml/src/ggml-cpu/quants.c` | 通用标量 vec_dot 和量化函数 |
+| `ggml/src/ggml-cpu/simd-gemm.h` | f32 SIMD GEMM（仅 flash_attn_ext 用） |
+| `ggml/src/ggml-cpu/repack.cpp` | 加载期权重重排 |
+| `ggml/src/ggml-cpu/llamafile/sgemm.h` | llamafile BLAS GEMM 入口 |

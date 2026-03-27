@@ -53,7 +53,7 @@ pub fn normalize_chat_reply(text: &str) -> String {
 
 pub fn default_chat_sampling() -> ChatSamplingConfig {
     ChatSamplingConfig {
-        max_len: 200,
+        max_len: 50,
         top_p: 0.6,
         top_k: 50,
         temperature: 0.7,
@@ -249,7 +249,7 @@ pub fn gguf_chats(
     );
     let project_dir = env!("CARGO_MANIFEST_DIR");
     let model_dir = PathBuf::from(project_dir).join("models").join("test");
-    let model_gguf_dir = model_dir.join("Llama-3.2-1B-Instruct-Q4_K_L.gguf");
+    let model_gguf_dir = model_dir.join("Llama-3.2-3B-Instruct.Q4_K.gguf");
     let start = Instant::now();
     let llama = llama::Llama::<f32>::from_gguf(&model_gguf_dir);
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
