@@ -1,5 +1,6 @@
 use serde::Deserialize;
 
+/// Llama 模型的 JSON 配置结构体（对应 config.json）
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub(crate) struct LlamaConfigJson {
     pub bos_token_id: u32,
@@ -31,14 +32,18 @@ pub(crate) struct LlamaConfigJson {
     pub mlp_bias: bool,          
 }
 
-/// llama 3 新增字段
-/// 定义 RoPE Scaling 的子结构体
+/// RoPE 位置编码的缩放配置（Llama 3 新增）
 #[derive(Debug, serde::Serialize,Deserialize, Clone, Default)]
 pub struct RopeScaling {
+    /// 缩放因子
     pub factor: f32,   
+    /// 高频缩放因子
     pub high_freq_factor: f32,
+    /// 低频缩放因子
     pub low_freq_factor: f32,   
+    /// 原始最大位置编码长度
     pub original_max_position_embeddings: usize,
+    /// RoPE 类型名称
     pub rope_type: String,  
     // 以防万一可选字段
     #[serde(default)]

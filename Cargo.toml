@@ -11,7 +11,7 @@ tokenizers = "0.19.1"
 rand = "0.8"
 half = {version = "2.4.1", features = ["std","num-traits","serde"]}
 num-traits = "0.2.19"
-rayon = "1.8"
+rayon = "1.8"  # gemm 的传递依赖，我们直接代码中不再使用
 gemm = "0.17"
 num-complex = "0.4" 
 gguf = "0.1.2"

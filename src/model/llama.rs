@@ -16,13 +16,14 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use gemm::Parallelism;
-use rayon::prelude::*;
+use crate::runtime::threadpool;
 use safetensors::SafeTensors;
 use num_traits::float::Float;
 use num_traits::Num;
 use num_traits::FromPrimitive;
 use gguf::{GGUFFile, GGUFMetadataValue};
 
+/// Decode 阶段的逐层耗时统计
 #[derive(Default)]
 struct DecodeLayerTiming {
     calls: usize,
@@ -30,12 +31,14 @@ struct DecodeLayerTiming {
     mlp_sums: Vec<f64>,
 }
 
+/// MLP 子模块的单层耗时记录
 #[derive(Default, Clone, Copy)]
 struct MlpTiming {
     gate_up_s: f64,
     down_s: f64,
 }
 
+/// Prefill 阶段的逐层耗时统计（QKV投影、注意力核心、注意力输出、MLP）
 #[derive(Default)]
 struct PrefillLayerTiming {
     calls: usize,
@@ -52,6 +55,7 @@ static DECODE_PACKED_LAYER_FILTER: OnceLock<Option<Vec<usize>>> = OnceLock::new(
 static PREFILL_LAYER_TIMING: OnceLock<Mutex<PrefillLayerTiming>> = OnceLock::new();
 static PREFILL_LAYER_TIMING_ENABLED: OnceLock<bool> = OnceLock::new();
 
+/// 是否开启 decode 逐层耗时打印（通过 LMRS_LAYER_TIMING 环境变量控制）
 #[inline]
 fn layer_timing_enabled() -> bool {
     *LAYER_TIMING_ENABLED.get_or_init(|| {
@@ -62,6 +66,7 @@ fn layer_timing_enabled() -> bool {
     })
 }
 
+/// 是否开启 prefill 逐层耗时打印（通过 LMRS_PREFILL_LAYER_TIMING 环境变量控制）
 #[inline]
 fn prefill_layer_timing_enabled() -> bool {
     *PREFILL_LAYER_TIMING_ENABLED.get_or_init(|| {
@@ -72,6 +77,7 @@ fn prefill_layer_timing_enabled() -> bool {
     })
 }
 
+/// 获取 decode 阶段需要使用 packed KV 模式的层索引列表（通过 LMRS_DECODE_PACKED_LAYERS 配置）
 #[inline]
 fn decode_packed_layer_filter() -> &'static Option<Vec<usize>> {
     DECODE_PACKED_LAYER_FILTER.get_or_init(|| {
@@ -97,6 +103,7 @@ fn decode_packed_layer_filter() -> &'static Option<Vec<usize>> {
     })
 }
 
+/// 判断指定层是否启用 packed KV 模式（由 LMRS_DECODE_PACKED_LAYERS 控制）
 #[inline]
 fn decode_use_packed_kv(layer: usize) -> bool {
     match decode_packed_layer_filter() {
@@ -105,6 +112,7 @@ fn decode_use_packed_kv(layer: usize) -> bool {
     }
 }
 
+/// 累积 decode 逐层耗时，每 32 步打印一次各层平均耗时和最慢层
 fn record_decode_layer_timing(layer: usize, n_layers: usize, attn_s: f64, mlp_s: f64) {
     let state = DECODE_LAYER_TIMING.get_or_init(|| Mutex::new(DecodeLayerTiming::default()));
     let mut g = state.lock().unwrap();
@@ -145,6 +153,7 @@ fn record_decode_layer_timing(layer: usize, n_layers: usize, attn_s: f64, mlp_s:
     }
 }
 
+/// 记录 prefill 逐层耗时，并在最后一层完成时打印汇总
 fn record_prefill_layer_timing(
     layer: usize,
     n_layers: usize,
@@ -239,6 +248,7 @@ pub struct Llama<T: Num> {
     eos_token_id: Vec<u32>,      
 }
 
+/// 将泛型切片安全重解释为 &[f32]（仅当 T 实际为 f32 时成功）
 #[inline]
 fn as_f32_slice<T: 'static>(x: &[T]) -> Option<&[f32]> {
     if TypeId::of::<T>() == TypeId::of::<f32>() {
@@ -249,6 +259,7 @@ fn as_f32_slice<T: 'static>(x: &[T]) -> Option<&[f32]> {
     }
 }
 
+/// 将泛型可变切片安全重解释为 &mut [f32]（仅当 T 实际为 f32 时成功）
 #[inline]
 fn as_f32_slice_mut<T: 'static>(x: &mut [T]) -> Option<&mut [f32]> {
     if TypeId::of::<T>() == TypeId::of::<f32>() {
@@ -259,6 +270,7 @@ fn as_f32_slice_mut<T: 'static>(x: &mut [T]) -> Option<&mut [f32]> {
     }
 }
 
+/// 将 f32 切片就地做 softmax，内含数值稳定的减最大值处理
 #[inline]
 fn softmax_inplace_f32(x: &mut [f32]) {
     let mut max_v = f32::NEG_INFINITY;
@@ -279,12 +291,11 @@ fn softmax_inplace_f32(x: &mut [f32]) {
     }
 }
 
+/// 带因果掩码的 softmax，按 group 并行处理注意力分数矩阵
 fn masked_softmax_f32(scores: &mut [f32], groups: usize, seq_len: usize, total_seq_len: usize) {
     let stride = seq_len * total_seq_len;
-    scores
-        .par_chunks_mut(stride)
-        .take(groups)
-        .for_each(|chunk| {
+    let used = groups * stride;
+    threadpool::parallel_chunks_mut(&mut scores[..used], stride, |_i, chunk| {
             for i in 0..seq_len {
                 let row = &mut chunk[i * total_seq_len..(i + 1) * total_seq_len];
                 let boundary = total_seq_len - seq_len + i + 1;
@@ -296,11 +307,13 @@ fn masked_softmax_f32(scores: &mut [f32], groups: usize, seq_len: usize, total_s
         });
 }
 
+/// 将 f32 切片进行内存拷贝
 #[inline]
 fn copy_f32(dst: &mut [f32], src: &[f32]) {
     dst.copy_from_slice(src);
 }
 
+/// 对 f32 切片进行标量缩放，有 AVX2 时走 SIMD 路径
 #[inline]
 fn scale_f32(x: &mut [f32], s: f32) {
     #[cfg(target_arch = "x86_64")]
@@ -317,6 +330,7 @@ fn scale_f32(x: &mut [f32], s: f32) {
     }
 }
 
+/// AXPY 操作：dst[i] += a * src[i]，有 AVX2 时走 SIMD 路径
 #[inline]
 fn axpy_f32(dst: &mut [f32], src: &[f32], a: f32) {
     #[cfg(target_arch = "x86_64")]
@@ -372,6 +386,7 @@ unsafe fn axpy_f32_avx2(dst: &mut [f32], src: &[f32], a: f32) {
     }
 }
 
+/// 将 Q 投影结果按 group 打包：从交错布局中提取指定 group 的所有序列位置向量
 #[inline]
 fn pack_q_group(
     q_data: &[f32],
@@ -389,6 +404,7 @@ fn pack_q_group(
     out
 }
 
+/// 将 K/V 缓存按 head 打包：从交错布局中提取指定 head 的所有时间步向量
 #[inline]
 fn pack_k_head(k_data: &[f32], total_seq_len: usize, k_stride: usize, head_base: usize, dqkv: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; total_seq_len * dqkv];
@@ -400,6 +416,7 @@ fn pack_k_head(k_data: &[f32], total_seq_len: usize, k_stride: usize, head_base:
     out
 }
 
+/// Q·K^T 矩阵乘法的 tiled 实现（分块计算以提高缓存命中率）
 #[inline]
 fn qk_matmul_tiled(
     scores: &mut [f32],
@@ -434,6 +451,7 @@ fn qk_matmul_tiled(
     }
 }
 
+/// Q·K^T 矩阵乘法的 gemm 实现（调用高性能 gemm 库）
 #[inline]
 fn qk_matmul_gemm(scores: &mut [f32], q_group: &[f32], k_head: &[f32], seq_len: usize, total_seq_len: usize, dqkv: usize, inv_sqrt: f32) {
     // 直接在 packed 切片上做 GEMM，避免每个 group 反复构造 Tensor 与复制数据。
@@ -463,6 +481,7 @@ fn qk_matmul_gemm(scores: &mut [f32], q_group: &[f32], k_head: &[f32], seq_len: 
     }
 }
 
+/// Attention·V 矩阵乘法的 tiled 实现（分块计算）
 #[inline]
 fn av_matmul_tiled(
     out: &mut [f32],
@@ -495,6 +514,7 @@ fn av_matmul_tiled(
     }
 }
 
+/// Attention·V 矩阵乘法的 gemm 实现（调用高性能 gemm 库）
 #[inline]
 fn av_matmul_gemm(
     out: &mut [f32],
@@ -532,6 +552,10 @@ fn av_matmul_gemm(
     }
 }
 
+/// 融合 decode 注意力计算（Online Softmax 算法）。
+/// 单 token decode 时无需先全量计算 attention scores 再 softmax，
+/// 而是在线逐步更新最大值和分母，一趟完成 Q·K^T → softmax → ·V 的融合计算，
+/// 减少中间内存分配和重复遍历。
 #[inline]
 fn fused_decode_attn_online(
     out: &mut [f32],
@@ -576,6 +600,9 @@ fn fused_decode_attn_online(
     scale_f32(out, inv);
 }
 
+/// Decode 阶段的 f32 专用自注意力内核。
+/// 支持两种模式：packed KV（将 K/V 按 head 预打包）和非 packed（直接在交错布局上计算）。
+/// 每个 attention head group 并行执行融合在线注意力。
 fn self_attention_decode_f32<T>(
     hidden_states: &mut Tensor<T>,
     q: &Tensor<T>,
@@ -621,10 +648,7 @@ where
             .map(|m| pack_k_head(v_data, total_seq_len, k_stride, m * dqkv, dqkv))
             .collect();
 
-        hidden
-            .par_chunks_mut(dqkv)
-            .enumerate()
-            .for_each(|(hg, out_chunk)| {
+        threadpool::parallel_chunks_mut(hidden, dqkv, |hg, out_chunk| {
                 let m = hg / n_groups;
                 let n = hg % n_groups;
                 let q_off = (m * n_groups + n) * dqkv;
@@ -641,10 +665,7 @@ where
                 );
             });
     } else {
-        hidden
-            .par_chunks_mut(dqkv)
-            .enumerate()
-            .for_each(|(hg, out_chunk)| {
+        threadpool::parallel_chunks_mut(hidden, dqkv, |hg, out_chunk| {
                 let m = hg / n_groups;
                 let n = hg % n_groups;
                 let q_off = (m * n_groups + n) * dqkv;
@@ -668,6 +689,12 @@ where
     true
 }
 
+/// Prefill 阶段的 f32 专用自注意力内核。
+/// 将 Q/K/V 按 head 预打包，然后对每个 group 并行计算：
+/// 1. Q·K^T 矩阵乘法（gemm 或 tiled）
+/// 2. 因果掩码 + softmax
+/// 3. Attention·V 矩阵乘法
+/// 最后将各 group 的输出重排回 hidden_states。
 fn self_attention_prefill_f32<T>(
     hidden_states: &mut Tensor<T>,
     att_scores: &mut Tensor<T>,
@@ -732,10 +759,7 @@ where
         })
         .collect();
 
-    scores
-        .par_chunks_mut(score_stride)
-        .enumerate()
-        .for_each(|(hg, chunk)| {
+    threadpool::parallel_chunks_mut(scores, score_stride, |hg, chunk| {
             let m = hg / n_groups;
             let q_group = &q_groups[hg];
             let k_head = &k_heads[m];
@@ -754,10 +778,7 @@ where
     // prefill 阶段按 group 一次算完整个 seq_len x dqkv 输出，
     // 避免之前按 row 循环时重复触发 GEMM 和 V 转置。
     let mut group_outputs = vec![0.0f32; groups * seq_len * dqkv];
-    group_outputs
-        .par_chunks_mut(seq_len * dqkv)
-        .enumerate()
-        .for_each(|(hg, out)| {
+    threadpool::parallel_chunks_mut(&mut group_outputs, seq_len * dqkv, |hg, out| {
             let m = hg / n_groups;
             let attn_chunk = &scores[hg * score_stride..(hg + 1) * score_stride];
             match backend {
@@ -793,6 +814,7 @@ where
     true
 }
 
+/// f32 向量点积的 SIMD 分发器：自动选择 AVX512/AVX2/NEON/标量路径
 #[inline]
 fn dot_f32_simd(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -1130,6 +1152,11 @@ impl<T> Llama<T>
         KVCache::new(self.n_layers, self.max_seq_len, self.n_kv_h * self.dqkv, 0)
     }
 
+    /// 获取模型可用的最大上下文长度
+    pub fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
     /// 获取结束token id列表（供外部流式生成判断是否停止）
     pub fn eos_token_ids(&self) -> &[u32] {
         &self.eos_token_id
@@ -1242,8 +1269,10 @@ impl<T> Llama<T>
             );
 
             // 生成完整的 k,v
-            let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
-            let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
+            // (total_seq, n_kv_h * dqkv)
+            let full_k = &mut cache.k_cache(layer, 0); 
+            // (total_seq, n_kv_h * dqkv)
+            let full_v = &mut cache.v_cache(layer, 0);
 
             let attn_stage_start = if (seq_len == 1 && layer_timing_enabled()) || enable_prefill_timing {
                 Some(Instant::now())
@@ -1448,7 +1477,6 @@ impl<T> Llama<T>
 }
 
 /// 注意力计算
-/// 需要性能优化
 fn self_attention<T>(
     // (seq, n_kv_h * n_groups * dqkv)
     hidden_states: &mut Tensor<T>,

@@ -9,12 +9,11 @@ use crate::formats::gguf::{
     QuantQ4KPrefillMetadata,
     QuantQ6KPrefillMetadata,
 };
-use crate::runtime::cpu;
 
 use gemm::Parallelism;
 use gguf::GGMLType;
 use num_traits::Float;
-use rayon::prelude::*;
+use crate::runtime::threadpool;
 use std::any::TypeId;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -78,6 +77,7 @@ struct QuantTypeTraits {
     max_prefill_q8k_col_tile: usize,
 }
 
+/// 收集指定量化布局的关键属性（点积类型、行数、x4 支持等），供调度逻辑使用
 #[inline]
 fn quant_type_traits<L: QuantLayout>() -> QuantTypeTraits {
     QuantTypeTraits {
@@ -109,6 +109,7 @@ impl PrefillQ8KKernelShape {
     }
 }
 
+/// 选择 Q8K 微内核形状（x1/x4/x8），根据权重行数和列数自动决定
 #[inline]
 fn prefill_q8k_kernel_shape(n: usize, m: usize, traits: QuantTypeTraits) -> Option<PrefillQ8KKernelShape> {
     // 允许 m 不被 nrows 整除：对齐部分走 x4 微内核，尾部走单行回退
@@ -124,16 +125,19 @@ fn prefill_q8k_kernel_shape(n: usize, m: usize, traits: QuantTypeTraits) -> Opti
     })
 }
 
+/// 从字节切片小端读取 u16
 #[inline]
 fn read_u16_le(bytes: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([bytes[off], bytes[off + 1]])
 }
 
+/// 从字节切片小端读取 u32
 #[inline]
 fn read_u32_le(bytes: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
 }
 
+/// 从 Q4K scales 中提取指定子块的 scale 和 min
 #[inline]
 fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
     if j < 4 {
@@ -145,6 +149,7 @@ fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
     }
 }
 
+/// 从 12 字节编码中解包 Q3K 的 16 个 scale 值（含偏移减 32）
 #[inline]
 fn unpack_q3k_scales(scales12: &[u8]) -> [i8; 16] {
     const KMASK1: u32 = 0x03030303;
@@ -174,6 +179,7 @@ fn unpack_q3k_scales(scales12: &[u8]) -> [i8; 16] {
     out
 }
 
+/// f32 向量点积 SIMD 分发：自动选择 AVX512/FMA+AVX2/AVX2/NEON/标量路径
 #[inline]
 fn dot_f32_simd(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -339,6 +345,7 @@ struct Q4K;
 struct Q5K;
 struct Q6K;
 
+/// Q8_0 块与 f32 向量的点积（先反量化再调 SIMD 点积）
 #[inline]
 fn q80_decode_block_dot_simd(raw: &[u8], a: &[f32]) -> f32 {
     let mut vals = [0.0f32; 32];
@@ -346,6 +353,7 @@ fn q80_decode_block_dot_simd(raw: &[u8], a: &[f32]) -> f32 {
     dot_f32_simd(a, &vals)
 }
 
+/// Q4K 块与 f32 向量的 legacy 点积（先反量化再 SIMD 点积）
 #[inline]
 fn q4k_decode_block_dot_legacy(raw: &[u8], a: &[f32]) -> f32 {
     let mut vals = [0.0f32; 256];
@@ -353,6 +361,7 @@ fn q4k_decode_block_dot_legacy(raw: &[u8], a: &[f32]) -> f32 {
     dot_f32_simd(a, &vals)
 }
 
+/// Q4K 块与 f32 向量的 direct 点积（不落地反量化，逐子块计算）
 #[inline]
 fn q4k_decode_block_dot_direct(raw: &[u8], a: &[f32]) -> f32 {
     let d = half::f16::from_bits(read_u16_le(raw, 0)).to_f32();
@@ -395,6 +404,7 @@ fn q4k_decode_block_dot_direct(raw: &[u8], a: &[f32]) -> f32 {
     sum
 }
 
+/// Q6K 块与 f32 向量的 legacy 点积
 #[inline]
 fn q6k_decode_block_dot_legacy(raw: &[u8], a: &[f32]) -> f32 {
     let mut vals = [0.0f32; 256];
@@ -402,6 +412,7 @@ fn q6k_decode_block_dot_legacy(raw: &[u8], a: &[f32]) -> f32 {
     dot_f32_simd(a, &vals)
 }
 
+/// Q6K 块与 f32 向量的 direct 点积
 #[inline]
 fn q6k_decode_block_dot_direct(raw: &[u8], a: &[f32]) -> f32 {
     let mut ql = &raw[0..128];
@@ -459,6 +470,7 @@ pub(crate) struct QuantQ80Block {
     sum: i16,
 }
 
+/// 将 32 个 f32 激活值量化为 Q8_0 块
 #[inline]
 fn quantize_activation_block_q80(x: &[f32]) -> QuantQ80Block {
     debug_assert!(x.len() == 32);
@@ -488,6 +500,7 @@ fn quantize_activation_block_q80(x: &[f32]) -> QuantQ80Block {
     out
 }
 
+/// Q4_0 块 × Q8_0 激活块的点积
 #[inline]
 fn q40_decode_block_dot_q80(raw: &[u8], a: &QuantQ80Block) -> f32 {
     if a.d == 0.0 {
@@ -504,6 +517,7 @@ fn q40_decode_block_dot_q80(raw: &[u8], a: &QuantQ80Block) -> f32 {
     d * a.d * (dot as f32 - 8.0 * a.sum as f32)
 }
 
+/// Q4_1 块 × Q8_0 激活块的点积
 #[inline]
 fn q41_decode_block_dot_q80(raw: &[u8], a: &QuantQ80Block) -> f32 {
     if a.d == 0.0 {
@@ -521,6 +535,7 @@ fn q41_decode_block_dot_q80(raw: &[u8], a: &QuantQ80Block) -> f32 {
     a.d * (d * dot as f32 + m0 * a.sum as f32)
 }
 
+/// Q5_0 块 × Q8_0 激活块的点积
 #[inline]
 fn q50_decode_block_dot_q80(raw: &[u8], a: &QuantQ80Block) -> f32 {
     if a.d == 0.0 {
@@ -540,6 +555,7 @@ fn q50_decode_block_dot_q80(raw: &[u8], a: &QuantQ80Block) -> f32 {
     d * a.d * (dot as f32 - 16.0 * a.sum as f32)
 }
 
+/// Q5_1 块 × Q8_0 激活块的点积
 #[inline]
 fn q51_decode_block_dot_q80(raw: &[u8], a: &QuantQ80Block) -> f32 {
     if a.d == 0.0 {
@@ -560,6 +576,7 @@ fn q51_decode_block_dot_q80(raw: &[u8], a: &QuantQ80Block) -> f32 {
     a.d * (d * dot as f32 + m0 * a.sum as f32)
 }
 
+/// Q8_0 块 × Q8_0 激活块的点积
 #[inline]
 fn q80_decode_block_dot_q80(raw: &[u8], a: &QuantQ80Block) -> f32 {
     if a.d == 0.0 {
@@ -601,6 +618,7 @@ fn q8k_x4_q(a: &QuantQ8KBlockX4, row: usize, idx: usize) -> i8 {
 ///   qs = [row0 的 256 字节 | row1 的 256 字节 | row2 的 256 字节 | row3 的 256 字节]
 /// 优点：每行数据连续存储，AVX2 可直接 loadu 256 位加载 32 字节，
 ///       且可直接复用单行 AVX2 点积内核。
+/// 将 4 行 Q8K 激活块打包为 x4 向量化块（行主序拼接）
 #[inline]
 fn pack_q8k_block_x4(rows: &[QuantQ8KBlock], _blocklen: usize) -> QuantQ8KBlockX4 {
     debug_assert!(rows.len() == 4);
@@ -622,6 +640,7 @@ fn pack_q8k_block_x4(rows: &[QuantQ8KBlock], _blocklen: usize) -> QuantQ8KBlockX
     out
 }
 
+/// 将多行 f32 激活值按 Q8K x4 格式打包（4 行一组）
 #[inline]
 fn pack_activation_panel_block_q8k_x4(
     a_rows_f32: &[f32],
@@ -767,6 +786,7 @@ unsafe fn quantize_activation_block_q8k_avx2(x: &[f32]) -> QuantQ8KBlock {
     out
 }
 
+/// 将一行 f32 激活值量化为 Q8K 块序列
 #[inline]
 fn quantize_activation_row_q8k(a: &[f32]) -> Vec<QuantQ8KBlock> {
     debug_assert!(a.len() % 256 == 0);
@@ -778,6 +798,7 @@ fn quantize_activation_row_q8k(a: &[f32]) -> Vec<QuantQ8KBlock> {
     out
 }
 
+/// Q4K 块 × Q8K 激活块的点积（自动选择 AVX2 或标量路径）
 #[inline]
 fn q4k_decode_block_dot_q8k(raw: &[u8], a: &QuantQ8KBlock) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -922,6 +943,7 @@ unsafe fn hsum_i32_avx2(v: std::arch::x86_64::__m256i) -> i32 {
     _mm_cvtsi128_si32(sum32)
 }
 
+/// Q6K 块 × Q8K 激活块的点积（自动选择 AVX2 或标量路径）
 #[inline]
 fn q6k_decode_block_dot_q8k(raw: &[u8], a: &QuantQ8KBlock) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -1136,6 +1158,7 @@ unsafe fn hsum_i32_sse(v: std::arch::x86_64::__m128i) -> i32 {
     _mm_cvtsi128_si32(sum32)
 }
 
+/// Q2K 块 × Q8K 激活块的点积
 #[inline]
 fn q2k_decode_block_dot_q8k(raw: &[u8], a: &QuantQ8KBlock) -> f32 {
     if a.d == 0.0 {
@@ -1181,6 +1204,7 @@ fn q2k_decode_block_dot_q8k(raw: &[u8], a: &QuantQ8KBlock) -> f32 {
     sum
 }
 
+/// Q3K 块 × Q8K 激活块的点积
 #[inline]
 fn q3k_decode_block_dot_q8k(raw: &[u8], a: &QuantQ8KBlock) -> f32 {
     if a.d == 0.0 {
@@ -1229,6 +1253,7 @@ fn q3k_decode_block_dot_q8k(raw: &[u8], a: &QuantQ8KBlock) -> f32 {
     sum
 }
 
+/// Q5K 块 × Q8K 激活块的点积
 #[inline]
 fn q5k_decode_block_dot_q8k(raw: &[u8], a: &QuantQ8KBlock) -> f32 {
     if a.d == 0.0 {
@@ -1281,6 +1306,7 @@ fn q5k_decode_block_dot_q8k(raw: &[u8], a: &QuantQ8KBlock) -> f32 {
     sum
 }
 
+/// Q2K 块 × Q8K x4 激活块的 4 路累加点积
 #[inline]
 fn q2k_accumulate_block_dot_q8k_x4(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f32; 4]) {
     if a.d.iter().all(|&d| d == 0.0) {
@@ -1336,6 +1362,7 @@ fn q2k_accumulate_block_dot_q8k_x4(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f
     }
 }
 
+/// Q3K 块 × Q8K x4 激活块的 4 路累加点积
 #[inline]
 fn q3k_accumulate_block_dot_q8k_x4(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f32; 4]) {
     if a.d.iter().all(|&d| d == 0.0) {
@@ -1392,6 +1419,7 @@ fn q3k_accumulate_block_dot_q8k_x4(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f
     }
 }
 
+/// Q5K 块 × Q8K x4 激活块的 4 路累加点积
 #[inline]
 fn q5k_accumulate_block_dot_q8k_x4(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f32; 4]) {
     if a.d.iter().all(|&d| d == 0.0) {
@@ -1454,6 +1482,7 @@ fn q5k_accumulate_block_dot_q8k_x4(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f
 
 /// Q4K × Q8K x4 累加：对 4 行激活分别执行 Q4K 点积并累加到 out。
 /// 非交错布局下每行 256 字节连续，可直接复用单行 AVX2 内核。
+/// Q4K 块 × Q8K x4 激活块的 4 路累加点积（自动选择 AVX2 或标量）
 #[inline]
 fn q4k_accumulate_block_dot_q8k_x4(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f32; 4]) {
     #[cfg(target_arch = "x86_64")]
@@ -1724,6 +1753,7 @@ unsafe fn q4k_accumulate_block_dot_q8k_x4_meta_avx2(
 
 /// Q6K × Q8K x4 累加：对 4 行激活分别执行 Q6K 点积并累加到 out。
 /// 非交错布局下每行 256 字节连续，可直接复用单行 AVX2 内核逻辑。
+/// Q6K 块 × Q8K x4 激活块的 4 路累加点积（自动选择 AVX2 或标量）
 #[inline]
 fn q6k_accumulate_block_dot_q8k_x4(raw: &[u8], a: &QuantQ8KBlockX4, out: &mut [f32; 4]) {
     #[cfg(target_arch = "x86_64")]
@@ -2876,23 +2906,27 @@ static HOT_MATRIX_CACHE: OnceLock<Mutex<MatrixCacheState>> = OnceLock::new();
 static PREFILL_BATCH_PROJ_ENABLED: OnceLock<bool> = OnceLock::new();
 static DIRECT_QK_VECDOT_ENABLED: OnceLock<bool> = OnceLock::new();
 
+/// 获取全局热矩阵缓存实例
 #[inline]
 fn hot_matrix_cache() -> &'static Mutex<MatrixCacheState> {
     HOT_MATRIX_CACHE.get_or_init(|| Mutex::new(MatrixCacheState::new(hot_matrix_cache_budget_bytes())))
 }
 
+/// 从热矩阵缓存中查找已反量化的 dense 矩阵
 #[inline]
 fn hot_matrix_cache_get(key: MatrixCacheKey) -> Option<Arc<Vec<f32>>> {
     let mut guard = hot_matrix_cache().lock().unwrap();
     guard.get(key)
 }
 
+/// 将反量化后的 dense 矩阵插入热矩阵缓存
 #[inline]
 fn hot_matrix_cache_insert(key: MatrixCacheKey, value: Arc<Vec<f32>>) {
     let mut guard = hot_matrix_cache().lock().unwrap();
     guard.insert(key, value);
 }
 
+/// 获取 prefill 预解码工作集内存预算（默认 64MB，通过 LMRS_PREFILL_PREDECODE_MB 配置）
 #[inline]
 fn prefill_predecode_budget_bytes() -> usize {
     *PREFILL_PREDECODE_BUDGET_MB.get_or_init(|| {
@@ -2904,6 +2938,7 @@ fn prefill_predecode_budget_bytes() -> usize {
     }) * 1024 * 1024
 }
 
+/// 获取 prefill tile 内存预算（默认 8MB，通过 LMRS_PREFILL_TILE_MB 配置）
 #[inline]
 fn prefill_tile_budget_bytes() -> usize {
     *PREFILL_TILE_BUDGET_MB.get_or_init(|| {
@@ -2915,6 +2950,7 @@ fn prefill_tile_budget_bytes() -> usize {
     }) * 1024 * 1024
 }
 
+/// 获取 prefill K 方向分块内存预算（默认 2MB，通过 LMRS_PREFILL_K_TILE_MB 配置）
 #[inline]
 fn prefill_k_tile_budget_bytes() -> usize {
     *PREFILL_K_TILE_BUDGET_MB.get_or_init(|| {
@@ -2926,6 +2962,7 @@ fn prefill_k_tile_budget_bytes() -> usize {
     }) * 1024 * 1024
 }
 
+/// 获取 prefill workset 内存预算（默认 256MB，通过 LMRS_PREFILL_WORKSET_MB 配置）
 #[inline]
 fn prefill_workset_budget_bytes() -> usize {
     *PREFILL_WORKSET_BUDGET_MB.get_or_init(|| {
@@ -2937,6 +2974,7 @@ fn prefill_workset_budget_bytes() -> usize {
     }) * 1024 * 1024
 }
 
+/// 获取 workset 使用的最小行数阈值（默认 8，通过 LMRS_PREFILL_WORKSET_MIN_ROWS 配置）
 #[inline]
 fn prefill_workset_min_rows() -> usize {
     *PREFILL_WORKSET_MIN_ROWS.get_or_init(|| {
@@ -2948,6 +2986,7 @@ fn prefill_workset_min_rows() -> usize {
     })
 }
 
+/// 获取热矩阵缓存内存限额（默认 2048MB，通过 LMRS_HOT_MATRIX_CACHE_MB 配置）
 #[inline]
 fn hot_matrix_cache_budget_bytes() -> usize {
     *HOT_MATRIX_CACHE_BUDGET_MB.get_or_init(|| {
@@ -2959,6 +2998,7 @@ fn hot_matrix_cache_budget_bytes() -> usize {
     }) * 1024 * 1024
 }
 
+/// 是否启用长 prompt 的 K 方向分块（默认关闭，通过 LMRS_PREFILL_LONGPROMPT_TILING 启用）
 #[inline]
 fn prefill_longprompt_tiling_enabled() -> bool {
     *PREFILL_LONGPROMPT_TILING_ENABLED.get_or_init(|| {
@@ -2969,6 +3009,7 @@ fn prefill_longprompt_tiling_enabled() -> bool {
     })
 }
 
+/// 是否启用 batch 投影调度（默认关闭，通过 LMRS_PREFILL_BATCH_PROJ 启用）
 #[inline]
 fn prefill_batch_proj_enabled() -> bool {
     *PREFILL_BATCH_PROJ_ENABLED.get_or_init(|| {
@@ -2979,6 +3020,7 @@ fn prefill_batch_proj_enabled() -> bool {
     })
 }
 
+/// 是否启用直接 QK 向量点积（默认关闭，通过 LMRS_DIRECT_QK_VECDOT 启用）
 #[inline]
 fn direct_qk_vecdot_enabled() -> bool {
     *DIRECT_QK_VECDOT_ENABLED.get_or_init(|| {
@@ -2998,6 +3040,7 @@ fn q235k_prefill_q8k_x4_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// 根据工作集大小和输入列数计算 prefill 的行方向 tile 大小
 #[inline]
 fn prefill_row_tile(k: usize, n: usize, m: usize) -> usize {
     if !prefill_longprompt_tiling_enabled() {
@@ -3055,6 +3098,7 @@ fn prefill_row_tile(k: usize, n: usize, m: usize) -> usize {
     by_budget.clamp(1, n.max(1)).min(row_cap).max(1)
 }
 
+/// 根据工作集大小计算 prefill 的 K 方向 tile（仅长 prompt 时生效）
 #[inline]
 fn prefill_k_tile(qk: usize, k: usize, row_cnt: usize, m: usize) -> usize {
     if !prefill_longprompt_tiling_enabled() {
@@ -3083,16 +3127,19 @@ fn prefill_k_tile(qk: usize, k: usize, row_cnt: usize, m: usize) -> usize {
     aligned.min(k).min(k_cap.max(qk))
 }
 
+/// 获取热矩阵缓存的统计数据：(命中次数, 缺失次数, 缓存条目数)
 pub fn quant_row_cache_stats() -> (u64, u64, usize) {
     let matrix_cache = hot_matrix_cache().lock().unwrap();
     matrix_cache.stats()
 }
 
+/// 清空热矩阵缓存
 pub fn quant_row_cache_clear() {
     let mut matrix_cache = hot_matrix_cache().lock().unwrap();
     matrix_cache.clear();
 }
 
+/// 将量化类型映射为唯一整数标签（用于缓存 key 构建）
 #[inline]
 fn ty_tag(ty: GGMLType) -> u32 {
     ty as u32
@@ -3140,6 +3187,7 @@ impl<'a> PreparedActivation<'a> {
     }
 }
 
+/// 将泛型激活数据转换为 f32 切片（若已为 f32 则零拷贝借用）
 fn prepare_activation_rows_f32<'a, T>(a_data: &'a [T], m: usize, k: usize) -> PreparedActivation<'a>
 where
     T: Float + Copy + Send + Sync + 'static,
@@ -3150,10 +3198,7 @@ where
         })
     } else {
         let mut rows = vec![0.0f32; m * k];
-        rows
-            .par_chunks_mut(k)
-            .enumerate()
-            .for_each(|(row_a, dst)| {
+        threadpool::parallel_chunks_mut(&mut rows, k, |row_a, dst| {
                 let src = &a_data[row_a * k..(row_a + 1) * k];
                 for i in 0..k {
                     dst[i] = src[i].to_f32().unwrap_or(0.0);
@@ -3163,6 +3208,7 @@ where
     }
 }
 
+/// 根据输出/输入维度比例判断 prefill 内核类型（Expansion vs Projection）
 #[inline]
 fn prefill_kernel_kind(n: usize, k: usize) -> PrefillKernelKind {
     if n > k {
@@ -3172,6 +3218,7 @@ fn prefill_kernel_kind(n: usize, k: usize) -> PrefillKernelKind {
     }
 }
 
+/// 根据内核类型和矩阵维度确定具体的 prefill 内核配置
 #[inline]
 fn prefill_kernel_profile(kind: PrefillKernelKind, n: usize, k: usize, m: usize) -> PrefillKernelProfile {
     match kind {
@@ -3183,6 +3230,7 @@ fn prefill_kernel_profile(kind: PrefillKernelKind, n: usize, k: usize, m: usize)
 }
 
 #[inline]
+/// 根据内核 profile 调整 row tile 大小
 fn prefill_row_tile_for_profile(profile: PrefillKernelProfile, k: usize, n: usize, m: usize) -> usize {
     let base = prefill_row_tile(k, n, m);
     let tuned = match profile {
@@ -3211,6 +3259,7 @@ fn prefill_row_tile_for_profile(profile: PrefillKernelProfile, k: usize, n: usiz
 }
 
 #[inline]
+/// 根据内核 profile 调整 K 方向 tile 大小
 fn prefill_k_tile_for_profile(
     profile: PrefillKernelProfile,
     qk: usize,
@@ -3229,6 +3278,7 @@ fn prefill_k_tile_for_profile(
     }
 }
 
+/// 综合计算 prefill 内核配置（row_tile + block_tile）
 #[inline]
 fn prefill_kernel_config(qk: usize, n: usize, k: usize, m: usize) -> PrefillKernelConfig {
     let kind = prefill_kernel_kind(n, k);
@@ -3241,6 +3291,7 @@ fn prefill_kernel_config(qk: usize, n: usize, k: usize, m: usize) -> PrefillKern
     }
 }
 
+/// 将激活行按 f32 格式打包为 panel。并行拷贝各行指定列范围的数据
 fn pack_activation_panel_block(
     a_rows_f32: &[f32],
     m: usize,
@@ -3249,10 +3300,7 @@ fn pack_activation_panel_block(
     col_len: usize,
 ) -> Vec<f32> {
     let mut panel = vec![0.0f32; m * col_len];
-    panel
-        .par_chunks_mut(col_len)
-        .enumerate()
-        .for_each(|(row, dst)| {
+    threadpool::parallel_chunks_mut(&mut panel, col_len, |row, dst| {
             let src_off = row * k + col_start;
             dst.copy_from_slice(&a_rows_f32[src_off..src_off + col_len]);
         });
@@ -3271,6 +3319,7 @@ enum PrefillActivationPanel {
     },
 }
 
+/// 将激活行按 Q8_0 格式打包为 panel
 #[inline]
 fn pack_activation_panel_block_q80(
     a_rows_f32: &[f32],
@@ -3290,6 +3339,7 @@ fn pack_activation_panel_block_q80(
     out
 }
 
+/// 将激活行按 Q8K 格式打包为 panel
 #[inline]
 fn pack_activation_panel_block_q8k(
     a_rows_f32: &[f32],
@@ -3309,6 +3359,7 @@ fn pack_activation_panel_block_q8k(
     out
 }
 
+/// 根据量化布局自动选择 F32/Q80/Q8K 格式打包激活 panel
 #[inline]
 fn pack_prefill_activation_panel<L: QuantLayout>(
     a_rows_f32: &[f32],
@@ -3336,11 +3387,13 @@ fn pack_prefill_activation_panel<L: QuantLayout>(
     }
 }
 
+/// 计算 panel 中指定行和块的索引
 #[inline]
 fn prefill_quant_panel_index(row_a: usize, blk: usize, block_cnt: usize) -> usize {
     row_a * block_cnt + blk
 }
 
+/// 将权重矩阵的一行反量化到 f32 输出缓冲区
 #[inline]
 fn decode_weight_row_into<L: QuantLayout>(
     wq: &QuantGGUFTensor,
@@ -3351,6 +3404,7 @@ fn decode_weight_row_into<L: QuantLayout>(
     decode_weight_row_range_into::<L>(wq, blocks_per_row, row_w, 0, blocks_per_row, out_row);
 }
 
+/// 将权重矩阵的一行指定块范围反量化到 f32 输出缓冲区
 #[inline]
 fn decode_weight_row_range_into<L: QuantLayout>(
     wq: &QuantGGUFTensor,
@@ -3373,17 +3427,20 @@ fn decode_weight_row_range_into<L: QuantLayout>(
     }
 }
 
+/// 计算 dense 矩阵所需字节数
 #[inline]
 fn dense_matrix_bytes(rows: usize, cols: usize) -> usize {
     rows.saturating_mul(cols)
         .saturating_mul(std::mem::size_of::<f32>())
 }
 
+/// 返回 stripe 布局的目标字节大小（256KB）
 #[inline]
 fn stripe_target_bytes() -> usize {
     256 * 1024
 }
 
+/// 根据列数计算 stripe 布局的行方向 tile
 #[inline]
 fn stripe_row_tile(rows: usize, cols: usize) -> usize {
     let base = if cols >= 8192 {
@@ -3396,6 +3453,7 @@ fn stripe_row_tile(rows: usize, cols: usize) -> usize {
     base.min(rows.max(1)).max(1)
 }
 
+/// 根据行 tile 和块大小计算 stripe 布局的块方向 tile
 #[inline]
 fn stripe_block_tile(blocks_per_row: usize, row_tile: usize, block_size: usize) -> usize {
     let bytes_per_block_row = row_tile.saturating_mul(block_size).max(1);
@@ -3403,6 +3461,7 @@ fn stripe_block_tile(blocks_per_row: usize, row_tile: usize, block_size: usize) 
     target.max(1).min(blocks_per_row.max(1))
 }
 
+/// 构建指定量化布局的 prefill 条带布局实现
 fn build_prefill_quant_stripe_layout_impl<L: QuantLayout>(wq: &QuantGGUFTensor) -> QuantPrefillStripeLayout {
     let rows = wq.rows();
     let cols = wq.cols();
@@ -3462,6 +3521,7 @@ pub fn build_prefill_quant_stripe_layout(wq: &QuantGGUFTensor) -> Option<QuantPr
     }
 }
 
+/// 构建指定量化布局的 Q8K 交错布局实现（按块主序重排）
 fn build_prefill_q8k_interleave_layout_impl<L: QuantLayout>(
     wq: &QuantGGUFTensor,
 ) -> QuantPrefillQ8KInterleaveLayout {
@@ -3488,6 +3548,7 @@ fn build_prefill_q8k_interleave_layout_impl<L: QuantLayout>(
     }
 }
 
+/// 构建 Q8K 交错 prefill 布局（仅支持 Q4K/Q6K 量化类型）
 pub fn build_prefill_q8k_interleave_layout(
     wq: &QuantGGUFTensor,
 ) -> Option<QuantPrefillQ8KInterleaveLayout> {
@@ -3502,6 +3563,7 @@ pub fn build_prefill_q8k_interleave_layout(
     }
 }
 
+/// 构建 packed prefill 布局（将量化权重预打包以提高 cache 利用率）
 pub fn build_prefill_packed_layout(wq: &QuantGGUFTensor) -> Option<QuantPrefillPackedLayout> {
     if wq.cols() == 0 {
         return None;
@@ -3528,6 +3590,7 @@ pub fn build_prefill_packed_layout(wq: &QuantGGUFTensor) -> Option<QuantPrefillP
     }
 }
 
+/// 拐取 Q4K 量化权重的 d/dmin/scales/mins 元数据，用于预计算 prefill
 fn build_prefill_q4k_metadata_layout(wq: &QuantGGUFTensor) -> QuantQ4KPrefillMetadata {
     let rows = wq.rows();
     let blocks_per_row = wq.cols() / Q4K::qk();
@@ -3562,6 +3625,7 @@ fn build_prefill_q4k_metadata_layout(wq: &QuantGGUFTensor) -> QuantQ4KPrefillMet
     }
 }
 
+/// 拐取 Q6K 量化权重的 d/scales 元数据，用于预计算 prefill
 fn build_prefill_q6k_metadata_layout(wq: &QuantGGUFTensor) -> QuantQ6KPrefillMetadata {
     let rows = wq.rows();
     let blocks_per_row = wq.cols() / Q6K::qk();
@@ -3586,6 +3650,7 @@ fn build_prefill_q6k_metadata_layout(wq: &QuantGGUFTensor) -> QuantQ6KPrefillMet
     }
 }
 
+/// 构建 K 量化 prefill 元数据布局（提取 super-block scale/min 用于加速 prefill 点积）
 pub fn build_prefill_k_metadata_layout(wq: &QuantGGUFTensor) -> Option<QuantPrefillKMetadata> {
     if wq.cols() == 0 {
         return None;
@@ -3613,10 +3678,7 @@ fn get_or_build_hot_dense_matrix<L: QuantLayout>(
         // 热点矩阵转成连续 dense 后，decode 可以跨 token 持续复用，
         // 当前默认主路径不再让 prefill 冷启动时主动构建它，避免重蹈阶段六的回退。
         let mut dense = vec![0.0f32; n * k];
-        dense
-            .par_chunks_mut(k)
-            .enumerate()
-            .for_each(|(row_w, out_row)| {
+        threadpool::parallel_chunks_mut(&mut dense, k, |row_w, out_row| {
                 decode_weight_row_into::<L>(wq, blocks_per_row, row_w, out_row);
             });
         let dense = Arc::new(dense);
@@ -3651,10 +3713,7 @@ fn apply_prefill_quant_row_range<T, L: QuantLayout>(
         None
     };
     let mut decoded_rows = vec![0.0f32; row_cnt * k_len];
-    decoded_rows
-        .par_chunks_mut(k_len)
-        .enumerate()
-        .for_each(|(i, out_row)| {
+    threadpool::parallel_chunks_mut(&mut decoded_rows, k_len, |i, out_row| {
             decode_weight_row_range_into::<L>(
                 wq,
                 blocks_per_row,
@@ -3686,14 +3745,11 @@ fn apply_prefill_quant_row_range<T, L: QuantLayout>(
                 false,
                 false,
                 false,
-                Parallelism::Rayon(cpu::prefill_threads()),
+                Parallelism::None,
             );
         }
     } else {
-        c_data
-            .par_chunks_mut(n)
-            .enumerate()
-            .for_each(|(row_a, c_row)| {
+        threadpool::parallel_chunks_mut(c_data, n, |row_a, c_row| {
                 let a_row_f32 = &a_panel_f32[row_a * k_len..(row_a + 1) * k_len];
                 for i in 0..row_cnt {
                     let row_w = row_start + i;
@@ -3758,10 +3814,7 @@ fn apply_prefill_quant_row_range_q80<T, L: QuantLayout>(
     T: Float + Default + Copy + std::iter::Sum + Send + Sync + 'static,
 {
     let row_cnt = row_end - row_start;
-    c_data
-        .par_chunks_mut(n)
-        .enumerate()
-        .for_each(|(row_a, c_row)| {
+    threadpool::parallel_chunks_mut(c_data, n, |row_a, c_row| {
             for i in 0..row_cnt {
                 let row_w = row_start + i;
                 let phys_row = wq.physical_row(row_w);
@@ -3830,10 +3883,7 @@ fn apply_prefill_quant_row_range_q8k<T, L: QuantLayout>(
     T: Float + Default + Copy + std::iter::Sum + Send + Sync + 'static,
 {
     let row_cnt = row_end - row_start;
-    c_data
-        .par_chunks_mut(n)
-        .enumerate()
-        .for_each(|(row_a, c_row)| {
+    threadpool::parallel_chunks_mut(c_data, n, |row_a, c_row| {
             for i in 0..row_cnt {
                 let row_w = row_start + i;
                 let phys_row = wq.physical_row(row_w);
@@ -3917,9 +3967,18 @@ fn apply_prefill_q8k_x4_microkernel<T, L: QuantLayout>(
         let a_base = row_group * block_cnt;
 
         // 对权重行维度 (n) 并行化：每个线程独立计算一批权重行的 4 路点积
-        let results: Vec<[f32; 4]> = (0..n)
-            .into_par_iter()
-            .map(|logical_row| {
+        let mut results: Vec<[f32; 4]> = vec![[0.0f32; 4]; n];
+        // SAFETY: 每个 logical_row 写入独立的不重叠元素
+        #[derive(Clone, Copy)]
+        struct SyncPtr(*mut [f32; 4]);
+        unsafe impl Send for SyncPtr {}
+        unsafe impl Sync for SyncPtr {}
+        impl SyncPtr {
+            #[inline(always)]
+            fn get(self) -> *mut [f32; 4] { self.0 }
+        }
+        let results_ptr = SyncPtr(results.as_mut_ptr());
+        threadpool::pool().parallel_for(n, |logical_row| {
                 let mut sums = [0.0f32; 4];
                 for blk in 0..block_cnt {
                     let a_blk = &a_panel_q8k_x4[a_base + blk];
@@ -3964,9 +4023,9 @@ fn apply_prefill_q8k_x4_microkernel<T, L: QuantLayout>(
                         _ => L::accumulate_block_dot_q8k_x4(block, a_blk, &mut sums),
                     }
                 }
-                sums
-            })
-            .collect();
+                // SAFETY: 每个 logical_row 独立写入不重叠的元素
+                unsafe { *results_ptr.get().add(logical_row) = sums; }
+            });
 
         // 将并行计算的结果写回输出矩阵
         for (col, sums) in results.iter().enumerate() {
@@ -3980,6 +4039,7 @@ fn apply_prefill_q8k_x4_microkernel<T, L: QuantLayout>(
     }
 }
 
+/// Q8K 交错布局的 prefill 矩阵乘法（使用预打包权重）
 fn matmul_prefill_with_layout_q8k_interleaved<T, L: QuantLayout>(
     c_data: &mut [T],
     n: usize,
@@ -4056,6 +4116,7 @@ fn matmul_prefill_with_layout_q8k_interleaved<T, L: QuantLayout>(
     }
 }
 
+/// Q8K 交错布局的 2 矩阵 prefill 并行乘法
 fn matmul_prefill_batch2_with_layout_q8k_interleaved<T, L: QuantLayout>(
     c0_data: &mut [T],
     c1_data: &mut [T],
@@ -4090,7 +4151,7 @@ fn matmul_prefill_batch2_with_layout_q8k_interleaved<T, L: QuantLayout>(
                 block_cnt,
                 blocklen,
             );
-            rayon::join(
+            threadpool::join(
                 || {
                     apply_prefill_q8k_x4_microkernel::<T, L>(
                         c0_data,
@@ -4137,7 +4198,7 @@ fn matmul_prefill_batch2_with_layout_q8k_interleaved<T, L: QuantLayout>(
                 block_cnt,
             );
             let b = if block_start == 0 { beta_f32 } else { 1.0 };
-            rayon::join(
+            threadpool::join(
                 || {
                     apply_prefill_quant_panel_to_output_q8k::<T, L>(
                         rem_c0, n, m_rem, &a_panel_q8k, wq0, b, alpha_f32,
@@ -4178,10 +4239,7 @@ fn apply_prefill_quant_row_range_from_stripe<T, L: QuantLayout>(
         None
     };
     let mut decoded_rows = vec![0.0f32; row_cnt * k_len];
-    decoded_rows
-        .par_chunks_mut(k_len)
-        .enumerate()
-        .for_each(|(i, out_row)| {
+    threadpool::parallel_chunks_mut(&mut decoded_rows, k_len, |i, out_row| {
             let row_base = i * block_cnt * L::block_size();
             for blk in 0..block_cnt {
                 let src_base = row_base + blk * L::block_size();
@@ -4214,14 +4272,11 @@ fn apply_prefill_quant_row_range_from_stripe<T, L: QuantLayout>(
                 false,
                 false,
                 false,
-                Parallelism::Rayon(cpu::prefill_threads()),
+                Parallelism::None,
             );
         }
     } else {
-        c_data
-            .par_chunks_mut(n)
-            .enumerate()
-            .for_each(|(row_a, c_row)| {
+        threadpool::parallel_chunks_mut(c_data, n, |row_a, c_row| {
                 let a_row_f32 = &a_panel_f32[row_a * k_len..(row_a + 1) * k_len];
                 for i in 0..row_cnt {
                     let row_w = row_start + i;
@@ -4247,10 +4302,7 @@ fn apply_prefill_quant_row_range_from_stripe_q80<T, L: QuantLayout>(
 ) where
     T: Float + Default + Copy + std::iter::Sum + Send + Sync + 'static,
 {
-    c_data
-        .par_chunks_mut(n)
-        .enumerate()
-        .for_each(|(row_a, c_row)| {
+    threadpool::parallel_chunks_mut(c_data, n, |row_a, c_row| {
             for i in 0..row_cnt {
                 let mut s = 0.0f32;
                 let row_base = i * block_cnt * L::block_size();
@@ -4281,10 +4333,7 @@ fn apply_prefill_quant_row_range_from_stripe_q8k<T, L: QuantLayout>(
 ) where
     T: Float + Default + Copy + std::iter::Sum + Send + Sync + 'static,
 {
-    c_data
-        .par_chunks_mut(n)
-        .enumerate()
-        .for_each(|(row_a, c_row)| {
+    threadpool::parallel_chunks_mut(c_data, n, |row_a, c_row| {
             for i in 0..row_cnt {
                 let mut s = 0.0f32;
                 let row_base = i * block_cnt * L::block_size();
@@ -4301,6 +4350,7 @@ fn apply_prefill_quant_row_range_from_stripe_q8k<T, L: QuantLayout>(
         });
 }
 
+/// 量化条带布局的 prefill 矩阵乘法（逐条带并行计算）
 fn matmul_prefill_with_stripes<T, L: QuantLayout>(
     c_data: &mut [T],
     n: usize,
@@ -4371,6 +4421,7 @@ fn matmul_prefill_with_stripes<T, L: QuantLayout>(
     }
 }
 
+/// 量化条带布局的 2 矩阵 prefill 并行乘法
 fn matmul_prefill_batch2_with_stripes<T, L: QuantLayout>(
     c0_data: &mut [T],
     c1_data: &mut [T],
@@ -4400,7 +4451,7 @@ fn matmul_prefill_batch2_with_stripes<T, L: QuantLayout>(
                 .expect("missing stripe for batch2 tensor 1");
             match &a_panel {
                 PrefillActivationPanel::F32(a_panel_f32) => {
-                    rayon::join(
+                    threadpool::join(
                         || {
                             apply_prefill_quant_row_range_from_stripe::<T, L>(
                                 c0_data,
@@ -4434,7 +4485,7 @@ fn matmul_prefill_batch2_with_stripes<T, L: QuantLayout>(
                     );
                 }
                 PrefillActivationPanel::Q80 { blocks, .. } => {
-                    rayon::join(
+                    threadpool::join(
                         || {
                             apply_prefill_quant_row_range_from_stripe_q80::<T, L>(
                                 c0_data,
@@ -4466,7 +4517,7 @@ fn matmul_prefill_batch2_with_stripes<T, L: QuantLayout>(
                     );
                 }
                 PrefillActivationPanel::Q8K { blocks, .. } => {
-                    rayon::join(
+                    threadpool::join(
                         || {
                             apply_prefill_quant_row_range_from_stripe_q8k::<T, L>(
                                 c0_data,
@@ -4509,10 +4560,7 @@ fn build_prefill_dense_workset<L: QuantLayout>(
     blocks_per_row: usize,
 ) -> Vec<f32> {
     let mut workset = vec![0.0f32; n * k];
-    workset
-        .par_chunks_mut(k)
-        .enumerate()
-        .for_each(|(row_w, out_row)| {
+    threadpool::parallel_chunks_mut(&mut workset, k, |row_w, out_row| {
             decode_weight_row_into::<L>(wq, blocks_per_row, row_w, out_row);
         });
     workset
@@ -4554,14 +4602,11 @@ fn apply_prefill_dense_workset_to_output<T>(
                 false,
                 false,
                 false,
-                Parallelism::Rayon(cpu::prefill_threads()),
+                Parallelism::None,
             );
         }
     } else {
-        c_data
-            .par_chunks_mut(n)
-            .enumerate()
-            .for_each(|(row_a, c_row)| {
+        threadpool::parallel_chunks_mut(c_data, n, |row_a, c_row| {
                 let a_row_f32 = &a_rows_f32[row_a * k..(row_a + 1) * k];
                 for row_w in 0..n {
                     let row_vals = &packed_weight_f32[row_w * k..(row_w + 1) * k];
@@ -4578,6 +4623,7 @@ fn prefill_workset_eligible(m: usize, total_bytes: usize) -> bool {
     m >= prefill_workset_min_rows() && total_bytes <= prefill_workset_budget_bytes()
 }
 
+/// 通用 prefill 矩阵乘法：分块反量化 + 并行点积累加
 fn matmul_prefill_with_layout<T, L: QuantLayout>(
     c_data: &mut [T],
     n: usize,
@@ -4668,6 +4714,7 @@ fn matmul_prefill_with_layout<T, L: QuantLayout>(
     }
 }
 
+/// 量化 panel 路径的 2 矩阵 prefill 并行乘法
 fn matmul_prefill_batch2_with_quant_panel<T, L: QuantLayout>(
     c0_data: &mut [T],
     c1_data: &mut [T],
@@ -4691,7 +4738,7 @@ fn matmul_prefill_batch2_with_quant_panel<T, L: QuantLayout>(
         match &a_panel {
             PrefillActivationPanel::F32(a_panel_f32) => {
                 let k_len = block_cnt * L::qk();
-                rayon::join(
+                threadpool::join(
                     || {
                         apply_prefill_panel_to_output::<T, L>(
                             c0_data,
@@ -4727,7 +4774,7 @@ fn matmul_prefill_batch2_with_quant_panel<T, L: QuantLayout>(
                 );
             }
             PrefillActivationPanel::Q80 { blocks, block_cnt } => {
-                rayon::join(
+                threadpool::join(
                     || {
                         apply_prefill_quant_panel_to_output_q80::<T, L>(
                             c0_data,
@@ -4761,7 +4808,7 @@ fn matmul_prefill_batch2_with_quant_panel<T, L: QuantLayout>(
                 );
             }
             PrefillActivationPanel::Q8K { blocks, block_cnt } => {
-                rayon::join(
+                threadpool::join(
                     || {
                         apply_prefill_quant_panel_to_output_q8k::<T, L>(
                             c0_data,
@@ -4798,6 +4845,7 @@ fn matmul_prefill_batch2_with_quant_panel<T, L: QuantLayout>(
     }
 }
 
+/// 2 矩阵共享输入的 prefill 并行矩阵乘法（自动选择最优布局路径）
 fn matmul_prefill_batch2_with_layout<T, L: QuantLayout>(
     c0: &mut Tensor<T>,
     c1: &mut Tensor<T>,
@@ -4880,7 +4928,7 @@ fn matmul_prefill_batch2_with_layout<T, L: QuantLayout>(
 
     if let (Some(packed0), Some(packed1)) = (wq0.prefill_workset.as_deref(), wq1.prefill_workset.as_deref()) {
         if prefill_batch_proj_enabled() {
-            rayon::join(
+            threadpool::join(
                 || apply_prefill_dense_workset_to_output(c0_data, wq0.rows(), m, k, a_rows_f32, packed0, beta_f32, alpha_f32),
                 || apply_prefill_dense_workset_to_output(c1_data, wq1.rows(), m, k, a_rows_f32, packed1, beta_f32, alpha_f32),
             );
@@ -4894,7 +4942,7 @@ fn matmul_prefill_batch2_with_layout<T, L: QuantLayout>(
     if prefill_batch_proj_enabled() && prefill_workset_eligible(m, total_workset_bytes) {
         let packed0 = build_prefill_dense_workset::<L>(wq0, wq0.rows(), k, blocks_per_row);
         let packed1 = build_prefill_dense_workset::<L>(wq1, wq1.rows(), k, blocks_per_row);
-        rayon::join(
+        threadpool::join(
             || apply_prefill_dense_workset_to_output(c0_data, wq0.rows(), m, k, a_rows_f32, &packed0, beta_f32, alpha_f32),
             || apply_prefill_dense_workset_to_output(c1_data, wq1.rows(), m, k, a_rows_f32, &packed1, beta_f32, alpha_f32),
         );
@@ -4905,6 +4953,7 @@ fn matmul_prefill_batch2_with_layout<T, L: QuantLayout>(
     matmul_with_layout::<T, L>(c1, beta, a, wq1, alpha);
 }
 
+/// 3 个权重矩阵共享同一输入的 prefill 并行矩阵乘法（QKV 投影）
 fn matmul_prefill_batch3_with_layout<T, L: QuantLayout>(
     c0: &mut Tensor<T>,
     c1: &mut Tensor<T>,
@@ -4948,10 +4997,10 @@ fn matmul_prefill_batch3_with_layout<T, L: QuantLayout>(
         wq2.prefill_workset.as_deref(),
     ) {
         if prefill_batch_proj_enabled() {
-            rayon::join(
+            threadpool::join(
                 || apply_prefill_dense_workset_to_output(c0_data, wq0.rows(), m, k, a_rows_f32, packed0, beta_f32, alpha_f32),
                 || {
-                    rayon::join(
+                    threadpool::join(
                         || apply_prefill_dense_workset_to_output(c1_data, wq1.rows(), m, k, a_rows_f32, packed1, beta_f32, alpha_f32),
                         || apply_prefill_dense_workset_to_output(c2_data, wq2.rows(), m, k, a_rows_f32, packed2, beta_f32, alpha_f32),
                     );
@@ -4969,10 +5018,10 @@ fn matmul_prefill_batch3_with_layout<T, L: QuantLayout>(
         let packed0 = build_prefill_dense_workset::<L>(wq0, wq0.rows(), k, blocks_per_row);
         let packed1 = build_prefill_dense_workset::<L>(wq1, wq1.rows(), k, blocks_per_row);
         let packed2 = build_prefill_dense_workset::<L>(wq2, wq2.rows(), k, blocks_per_row);
-        rayon::join(
+        threadpool::join(
             || apply_prefill_dense_workset_to_output(c0_data, wq0.rows(), m, k, a_rows_f32, &packed0, beta_f32, alpha_f32),
             || {
-                rayon::join(
+                threadpool::join(
                     || apply_prefill_dense_workset_to_output(c1_data, wq1.rows(), m, k, a_rows_f32, &packed1, beta_f32, alpha_f32),
                     || apply_prefill_dense_workset_to_output(c2_data, wq2.rows(), m, k, a_rows_f32, &packed2, beta_f32, alpha_f32),
                 );
@@ -4986,6 +5035,7 @@ fn matmul_prefill_batch3_with_layout<T, L: QuantLayout>(
     matmul_with_layout::<T, L>(c2, beta, a, wq2, alpha);
 }
 
+/// 量化矩阵乘法主入口：根据 seq_len 自动分发到 decode（单行）或 prefill（多行）路径
 fn matmul_with_layout<T, L: QuantLayout>(c: &mut Tensor<T>, beta: T, a: &Tensor<T>, wq: &QuantGGUFTensor, alpha: T)
 where
     T: Float + Default + Copy + std::iter::Sum + Send + Sync + 'static,
@@ -5038,7 +5088,7 @@ where
         if use_hot_matrix_cache {
             let dense_matrix = get_or_build_hot_dense_matrix::<L>(wq, n, k, blocks_per_row);
 
-            c_row.par_iter_mut().enumerate().for_each(|(row_w, out)| {
+            threadpool::parallel_iter_mut(c_row, |row_w, out| {
                 let row_vals = &dense_matrix[row_w * k..(row_w + 1) * k];
                 let sum = dot_f32_simd(&a_row_f32, row_vals);
                 let old = out.to_f32().unwrap_or(0.0);
@@ -5046,7 +5096,7 @@ where
             });
         } else {
             // decode 路径：每个权重行的点积独立计算，par_iter 并行化
-            c_row.par_iter_mut().enumerate().for_each(|(row_w, out)| {
+            threadpool::parallel_iter_mut(c_row, |row_w, out| {
                 let phys_row = wq.physical_row(row_w);
                 let row_base = phys_row * blocks_per_row * L::block_size();
                 let mut s = 0.0f32;
@@ -5147,6 +5197,7 @@ pub fn matmul_transb_gguf_quant<T>(
     }
 }
 
+/// 双矩阵批量量化矩阵乘法，prefill 阶段 2 个权重矩阵共享同一输入的并行计算
 pub fn matmul_transb_gguf_quant_batch2<T>(
     c0: &mut Tensor<T>,
     c1: &mut Tensor<T>,
@@ -5180,6 +5231,7 @@ pub fn matmul_transb_gguf_quant_batch2<T>(
     }
 }
 
+/// 三矩阵批量量化矩阵乘法，prefill 阶段 3 个权重矩阵共享同一输入的并行计算
 pub fn matmul_transb_gguf_quant_batch3<T>(
     c0: &mut Tensor<T>,
     c1: &mut Tensor<T>,

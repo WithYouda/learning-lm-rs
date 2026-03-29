@@ -453,7 +453,7 @@ release 连续口径最新摘要：
     .nrows         = 1,                         // x86 上每次 vec_dot 处理 1 行
 };
 ```
-- 所有 K-quant 的 `vec_dot_type` 都是 `GGML_TYPE_Q8_K`。
+- 所有 K-quant 的 `vec_dot_type` 都是 `GGML_TYPE_Q8_K`。 
 - ARM MMLA 上 Q4_K 的 `nrows=2`（一次 vec_dot 处理 2 行）。
 
 ### 三、根因对照分析

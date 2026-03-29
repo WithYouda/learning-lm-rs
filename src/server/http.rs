@@ -536,45 +536,49 @@ fn handle_chat(state: &Arc<ServerState>, stream: &mut TcpStream, session_id: u64
     }
 
     // 从会话中提取推理所需的状态
-        let (model_name, system_prompt, cache, history_ids, is_first_turn, cancel_flag, _generating_flag) = {
-        let mut sessions = state.sessions.lock().unwrap();
-        let session = match sessions.get_mut(&session_id) {
-            Some(s) => s,
-            None => {
+    let (model_name, system_prompt, 
+             cache, history_ids,
+             is_first_turn, cancel_flag,
+             _generating_flag) 
+    = {
+            let mut sessions = state.sessions.lock().unwrap();
+            let session = match sessions.get_mut(&session_id) {
+                Some(s) => s,
+                None => {
+                    drop(sessions);
+                    send_json(stream, 404, &json!({"error": "会话不存在"}));
+                    return;
+                }
+            };
+
+            // 检查是否已在生成中
+            if session.generating.load(Ordering::Relaxed) {
                 drop(sessions);
-                send_json(stream, 404, &json!({"error": "会话不存在"}));
+                send_json(stream, 409, &json!({"error": "该会话正在推理中"}));
                 return;
             }
-        };
 
-        // 检查是否已在生成中
-        if session.generating.load(Ordering::Relaxed) {
-            drop(sessions);
-            send_json(stream, 409, &json!({"error": "该会话正在推理中"}));
-            return;
-        }
-
-        // 如果请求中带了新的system prompt，更新到会话
-        if let Some(ref sp) = system_prompt_override {
-            if !sp.is_empty() {
-                session.system_prompt = sp.clone();
+            // 如果请求中带了新的system prompt，更新到会话
+            if let Some(ref sp) = system_prompt_override {
+                if !sp.is_empty() {
+                    session.system_prompt = sp.clone();
+                }
             }
-        }
 
-        // 标记开始生成，重置取消标志
-        session.generating.store(true, Ordering::Relaxed);
-        session.cancel_flag.store(false, Ordering::Relaxed);
+            // 标记开始生成，重置取消标志
+            session.generating.store(true, Ordering::Relaxed);
+            session.cancel_flag.store(false, Ordering::Relaxed);
 
-        // 取出cache（推理期间会话无法被其他请求使用）
-        let cache = session.cache.take();
-        let model_name = session.model_name.clone();
-        let system_prompt = session.system_prompt.clone();
-        let history_ids = session.history_ids.clone();
-        let is_first_turn = session.is_first_turn;
-        let cancel_flag = Arc::clone(&session.cancel_flag);
-        let generating_flag = Arc::clone(&session.generating);
+            // 取出cache（推理期间会话无法被其他请求使用）
+            let cache = session.cache.take();
+            let model_name = session.model_name.clone();
+            let system_prompt = session.system_prompt.clone();
+            let history_ids = session.history_ids.clone();
+            let is_first_turn = session.is_first_turn;
+            let cancel_flag = Arc::clone(&session.cancel_flag);
+            let generating_flag = Arc::clone(&session.generating);
 
-        (model_name, system_prompt, cache, history_ids, is_first_turn, cancel_flag, generating_flag)
+            (model_name, system_prompt, cache, history_ids, is_first_turn, cancel_flag, generating_flag)
     };
 
     // 确保模型已加载
@@ -610,6 +614,31 @@ fn handle_chat(state: &Arc<ServerState>, stream: &mut TcpStream, session_id: u64
         }
     };
     let input_ids = encoded.get_ids();
+    let context_limit = model.max_seq_len();
+    let context_used = cache.len();
+
+    // prompt 本身如果已经放不进上下文窗口，就直接返回错误，避免启动 SSE 后中途断流。
+    if context_used + input_ids.len() > context_limit {
+        let mut sessions = state.sessions.lock().unwrap();
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.cache = Some(cache);
+            session.generating.store(false, Ordering::Relaxed);
+            session.cancel_flag.store(false, Ordering::Relaxed);
+        }
+        send_json(
+            stream,
+            400,
+            &json!({
+                "error": format!(
+                    "已达到模型最大上下文长度（当前缓存 {} tokens，新输入 {} tokens，窗口上限 {} tokens），请重置会话或新建会话后继续。",
+                    context_used,
+                    input_ids.len(),
+                    context_limit,
+                )
+            }),
+        );
+        return;
+    }
 
     // 发送SSE响应头
     send_sse_header(stream);
@@ -626,15 +655,24 @@ fn handle_chat(state: &Arc<ServerState>, stream: &mut TcpStream, session_id: u64
     let mut generated_ids = Vec::new();
     let mut generated_tokens = 0usize;
     let mut cancelled = false;
+    let mut finish_message: Option<String> = None;
 
     let gen_start = Instant::now();
 
     // 核心推理循环：每生成一个token就通过SSE推送给客户端
-    let turn_end_token = loop {
+    let (turn_end_token, finish_reason) = loop {
         // 检查取消标志
         if cancel_flag.load(Ordering::Relaxed) {
             cancelled = true;
-            break None;
+            break (None, "cancelled");
+        }
+
+        if cache.len() + input_tensor.size() > context_limit {
+            finish_message = Some(format!(
+                "已达到模型最大上下文长度（{} tokens），请重置会话后继续。",
+                context_limit
+            ));
+            break (None, "context_limit");
         }
 
         // 前向传播 + 采样
@@ -643,7 +681,7 @@ fn handle_chat(state: &Arc<ServerState>, stream: &mut TcpStream, session_id: u64
 
         // 检查是否遇到结束token
         if eos_ids.contains(&id) {
-            break Some(id);
+            break (Some(id), "eos");
         }
 
         all_ids.push(id);
@@ -660,12 +698,13 @@ fn handle_chat(state: &Arc<ServerState>, stream: &mut TcpStream, session_id: u64
         if !send_sse_data(stream, &event.to_string()) {
             // 客户端断开连接
             cancelled = true;
-            break None;
+            break (None, "client_disconnect");
         }
 
         // 检查是否达到最大长度
         if generated_tokens >= max_len {
-            break eos_ids.first().copied();
+            finish_message = Some(format!("已达到最大生成长度（{} tokens）。", max_len));
+            break (eos_ids.first().copied(), "max_len");
         }
 
         // 准备下一轮decode的输入（单token）
@@ -677,11 +716,18 @@ fn handle_chat(state: &Arc<ServerState>, stream: &mut TcpStream, session_id: u64
 
     // 如果有结束token，将其写入cache以保持多轮对话的一致性
     if let Some(end_id) = turn_end_token {
-        unsafe {
-            decode_token_tensor.data_mut()[0] = end_id;
+        if cache.len() < context_limit {
+            unsafe {
+                decode_token_tensor.data_mut()[0] = end_id;
+            }
+            let end_input = decode_token_tensor.slice(0, &one_shape);
+            let _ = model.forward(&end_input, &mut cache);
+        } else if finish_message.is_none() {
+            finish_message = Some(format!(
+                "已达到模型最大上下文长度（{} tokens），本轮输出已结束。",
+                context_limit
+            ));
         }
-        let end_input = decode_token_tensor.slice(0, &one_shape);
-        let _ = model.forward(&end_input, &mut cache);
     }
 
     let elapsed = gen_start.elapsed();
@@ -694,6 +740,10 @@ fn handle_chat(state: &Arc<ServerState>, stream: &mut TcpStream, session_id: u64
         "tokens_generated": generated_tokens,
         "elapsed_ms": elapsed.as_millis(),
         "cancelled": cancelled,
+        "finish_reason": finish_reason,
+        "message": finish_message,
+        "context_limit": context_limit,
+        "context_used": cache.len(),
         "tokens_per_sec": if elapsed.as_secs_f64() > 0.0 {
             generated_tokens as f64 / elapsed.as_secs_f64()
         } else { 0.0 },

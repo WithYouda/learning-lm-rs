@@ -409,11 +409,12 @@
 
       <div class="param-row">
         <div class="param-label">
-          <span>最大生成长度</span>
+          <span>最大新生成 token</span>
           <span class="val" id="lbl-max-len">256</span>
         </div>
         <input type="range" id="param-max-len" min="16" max="2048" step="16" value="256"
           oninput="document.getElementById('lbl-max-len').textContent=this.value" />
+        <small style="color:var(--muted);font-size:11px;margin-top:4px;display:block">本轮 = 点击一次发送后，assistant 这一次回复；它不会改变模型上下文窗口上限</small>
       </div>
 
       <div class="param-row">
@@ -490,9 +491,10 @@
     <!-- 统计信息 -->
     <div class="params-section">
       <h3>统计</h3>
-      <div class="stat-row"><span class="stat-key">已生成 tokens</span><span class="stat-val" id="stat-tokens">0</span></div>
+      <div class="stat-row"><span class="stat-key">本轮输出 tokens</span><span class="stat-val" id="stat-tokens">0</span></div>
       <div class="stat-row"><span class="stat-key">生成速度</span><span class="stat-val" id="stat-speed">— tok/s</span></div>
       <div class="stat-row"><span class="stat-key">上次耗时</span><span class="stat-val" id="stat-time">—</span></div>
+      <div class="stat-row"><span class="stat-key">上下文占用</span><span class="stat-val" id="stat-context">—</span></div>
     </div>
 
   </div>
@@ -541,10 +543,8 @@ const msgHistory = {};
 const draftInput = {};
 /** 可用模型列表 */
 let availableModels = [];
-/** 本次推理的 EventSource */
-let currentEventSource = null;
-/** 累计生成 token 数（统计） */
-let totalTokensThisSession = 0;
+/** 当前正在进行的流式请求，key 为 session_id */
+const activeStreamRequests = {};
 
 // ===========================================================================
 //  初始化
@@ -602,9 +602,61 @@ async function refreshSessions() {
         sessions[s.id].generating = s.generating;
         if (!sessions[s.id].system_prompt) sessions[s.id].system_prompt = s.system_prompt;
       }
+      if (sessions[s.id].lastTurnTokens === undefined) sessions[s.id].lastTurnTokens = 0;
+      if (sessions[s.id].lastTurnSpeed === undefined) sessions[s.id].lastTurnSpeed = '— tok/s';
+      if (sessions[s.id].lastTurnTime === undefined) sessions[s.id].lastTurnTime = '—';
+      if (sessions[s.id].lastContext === undefined) sessions[s.id].lastContext = '—';
     }
     renderSidebar();
   } catch (_) {}
+}
+
+function renderStatsForSession(sid) {
+  const stats = sid && sessions[sid] ? sessions[sid] : null;
+  document.getElementById('stat-tokens').textContent = stats ? String(stats.lastTurnTokens || 0) : '0';
+  document.getElementById('stat-speed').textContent = stats?.lastTurnSpeed || '— tok/s';
+  document.getElementById('stat-time').textContent = stats?.lastTurnTime || '—';
+  document.getElementById('stat-context').textContent = stats?.lastContext || '—';
+}
+
+function rememberTurnStats(sid, tokens, elapsedSec, speed, contextUsed, contextLimit) {
+  if (!sessions[sid]) return;
+  sessions[sid].lastTurnTokens = tokens;
+  sessions[sid].lastTurnSpeed = `${speed.toFixed(1)} tok/s`;
+  sessions[sid].lastTurnTime = `${elapsedSec.toFixed(2)}s`;
+  sessions[sid].lastContext = Number.isFinite(contextUsed) && Number.isFinite(contextLimit)
+    ? `${contextUsed}/${contextLimit}`
+    : '—';
+}
+
+async function requestStopFromServer(sid) {
+  if (!sid) return;
+  await fetch(`/api/sessions/${sid}/stop`, { method: 'POST' });
+}
+
+async function cancelActiveStream(sid, reasonLabel, fallbackText) {
+  const stream = activeStreamRequests[sid];
+  if (!stream || stream.finished) return false;
+
+  stream.finished = true;
+  stream.aborted = true;
+
+  try {
+    if (stream.reader) await stream.reader.cancel();
+  } catch (_) {}
+
+  try {
+    stream.controller.abort();
+  } catch (_) {}
+
+  delete activeStreamRequests[sid];
+
+  const finalText = fallbackText || stream.buffer || '⚠ 推理已停止';
+  const stats = stream.tokenCount > 0
+    ? `${stream.tokenCount} tokens · ${reasonLabel}`
+    : reasonLabel;
+  finishGeneration(sid, stream.assistantIdx, finalText, stats);
+  return true;
 }
 
 // ===========================================================================
@@ -665,6 +717,10 @@ async function createSession() {
       system_prompt: systemPrompt,
       is_first_turn: true,
       generating: false,
+      lastTurnTokens: 0,
+      lastTurnSpeed: '— tok/s',
+      lastTurnTime: '—',
+      lastContext: '—',
       name: name || ('会话 #' + sid),
     };
     msgHistory[sid] = [];
@@ -690,11 +746,11 @@ function switchSession(sid) {
 
   activeSessionId = sid;
   const s = sessions[sid];
-  totalTokensThisSession = 0;
 
   // 更新顶部标题
   document.getElementById('chat-title').textContent = s.name;
   document.getElementById('chat-meta').textContent = `模型：${s.model_name}`;
+  renderStatsForSession(sid);
 
   // 同步参数面板
   document.getElementById('param-system').value = s.system_prompt || '';
@@ -775,18 +831,41 @@ async function resetSession(sid, silent) {
   if (!silent) {
     if (!confirm('确认清空此会话的对话历史？')) return false;
   }
+
+  if (sessions[sid]?.generating) {
+    try { await requestStopFromServer(sid); } catch (_) {}
+    await cancelActiveStream(sid, '重置前已停止', '⚠ 已在重置前终止当前输出');
+  }
+
   try {
-    const resp = await fetch(`/api/sessions/${sid}/reset`, { method: 'POST' });
-    if (!resp.ok) {
-      const err = await resp.json();
-      showToast(err.error || '重置失败', 'error');
-      return false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const resp = await fetch(`/api/sessions/${sid}/reset`, { method: 'POST' });
+      if (resp.ok) {
+        msgHistory[sid] = [];
+        if (sessions[sid]) {
+          sessions[sid].is_first_turn = true;
+          sessions[sid].lastTurnTokens = 0;
+          sessions[sid].lastTurnSpeed = '— tok/s';
+          sessions[sid].lastTurnTime = '—';
+          sessions[sid].lastContext = '—';
+        }
+        if (sid === activeSessionId) {
+          renderMessages(sid);
+          renderStatsForSession(sid);
+        }
+        if (!silent) showToast('对话已重置', 'success');
+        return true;
+      }
+
+      const err = await resp.json().catch(() => ({ error: '重置失败' }));
+      if (resp.status !== 409 || attempt === 2) {
+        showToast(err.error || '重置失败', 'error');
+        return false;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 120));
     }
-    msgHistory[sid] = [];
-    if (sessions[sid]) sessions[sid].is_first_turn = true;
-    if (sid === activeSessionId) renderMessages(sid);
-    if (!silent) showToast('对话已重置', 'success');
-    return true;
+    return false;
   } catch (e) {
     showToast('网络错误: ' + e.message, 'error');
     return false;
@@ -798,6 +877,12 @@ async function deleteCurrentSession() {
   if (!activeSessionId) return;
   if (!confirm('确认删除此会话？')) return;
   const sid = activeSessionId;
+
+  if (sessions[sid]?.generating) {
+    try { await requestStopFromServer(sid); } catch (_) {}
+    await cancelActiveStream(sid, '删除前已停止', '⚠ 已在删除前终止当前输出');
+  }
+
   try {
     await fetch(`/api/sessions/${sid}`, { method: 'DELETE' });
   } catch (_) {}
@@ -809,6 +894,7 @@ async function deleteCurrentSession() {
   document.getElementById('chat-title').textContent = '请先创建一个会话';
   document.getElementById('chat-meta').textContent = '';
   document.getElementById('btn-send').disabled = true;
+  renderStatsForSession(null);
   showToast('会话已删除', 'success');
 }
 
@@ -840,6 +926,10 @@ function renderSidebar() {
 async function deleteSessionById(e, sid) {
   e.stopPropagation();
   if (!confirm('确认删除会话 "' + (sessions[sid]?.name || sid) + '"？')) return;
+  if (sessions[sid]?.generating) {
+    try { await requestStopFromServer(sid); } catch (_) {}
+    await cancelActiveStream(sid, '删除前已停止', '⚠ 已在删除前终止当前输出');
+  }
   try { await fetch('/api/sessions/' + sid, { method: 'DELETE' }); } catch (_) {}
   delete sessions[sid];
   delete msgHistory[sid];
@@ -849,6 +939,7 @@ async function deleteSessionById(e, sid) {
     document.getElementById('chat-meta').textContent = '';
     document.getElementById('btn-send').disabled = true;
     renderMessages(null);
+    renderStatsForSession(null);
   }
   renderSidebar();
   showToast('已删除', 'success');
@@ -969,6 +1060,21 @@ function updateSendButtons(generating) {
   }
 }
 
+function buildDoneStats(msg) {
+  let stats = `${msg.tokens_generated} tokens · ${(msg.elapsed_ms / 1000).toFixed(2)}s · ${msg.tokens_per_sec.toFixed(1)} tok/s`;
+  if (msg.finish_reason === 'max_len') {
+    stats += ' · 达到最大生成长度';
+  } else if (msg.finish_reason === 'context_limit') {
+    stats += ' · 达到上下文窗口上限';
+  } else if (msg.cancelled) {
+    stats += ' · 已取消';
+  }
+  if (Number.isFinite(msg.context_used) && Number.isFinite(msg.context_limit)) {
+    stats += ` · ctx ${msg.context_used}/${msg.context_limit}`;
+  }
+  return stats;
+}
+
 /** 切换推理设备（目前仅 CPU 可用） */
 function selectDevice(device) {
   document.getElementById('dev-cpu').classList.toggle('active', device === 'cpu');
@@ -1019,34 +1125,111 @@ async function sendMessage() {
   }
   updateSendButtons(true);
   renderSidebar();
+  document.getElementById('stat-tokens').textContent = '0';
+  document.getElementById('stat-speed').textContent = '— tok/s';
+  document.getElementById('stat-time').textContent = '—';
 
   // 通过 SSE 发起流式推理
   let buffer = '';
   let tokenCount = 0;
   const startMs = Date.now();
+  let receivedDone = false;
+  const controller = new AbortController();
+  const streamState = {
+    controller,
+    reader: null,
+    assistantIdx,
+    buffer: '',
+    tokenCount: 0,
+    finished: false,
+    aborted: false,
+  };
+  activeStreamRequests[sid] = streamState;
 
   try {
     const response = await fetch(`/api/sessions/${sid}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
       body: JSON.stringify(params),
     });
 
     if (!response.ok) {
       const err = await response.json().catch(() => ({ error: '未知错误' }));
-      updateStreamingBubble(sid, assistantIdx, '⚠ ' + (err.error || '推理失败'), true);
-      finishGeneration(sid, assistantIdx, buffer, null);
+      delete activeStreamRequests[sid];
+      finishGeneration(sid, assistantIdx, '⚠ ' + (err.error || '推理失败'), null);
+      return;
+    }
+
+    if (!response.body) {
+      delete activeStreamRequests[sid];
+      finishGeneration(sid, assistantIdx, buffer || '⚠ 推理连接不可用', null);
       return;
     }
 
     // 逐行读取 SSE 流
     const reader = response.body.getReader();
+    streamState.reader = reader;
     const decoder = new TextDecoder();
     let partial = '';
 
+    const processEvent = async (rawEvent) => {
+      const event = rawEvent.trim();
+      if (!event.startsWith('data:')) return false;
+
+      const jsonStr = event.replace(/^data:\s*/, '');
+      try {
+        const msg = JSON.parse(jsonStr);
+        if (msg.type === 'token') {
+          buffer = msg.text;
+          tokenCount++;
+          streamState.buffer = buffer;
+          streamState.tokenCount = tokenCount;
+          updateStreamingBubble(sid, assistantIdx, buffer, false);
+          if (sid === activeSessionId) {
+            const elapsed = (Date.now() - startMs) / 1000;
+            document.getElementById('stat-tokens').textContent = tokenCount;
+            document.getElementById('stat-speed').textContent =
+              elapsed > 0 ? (tokenCount / elapsed).toFixed(1) + ' tok/s' : '—';
+          }
+          return false;
+        }
+
+        if (msg.type === 'done') {
+          receivedDone = true;
+          streamState.finished = true;
+          delete activeStreamRequests[sid];
+
+          const stats = buildDoneStats(msg);
+          const finalText = msg.full_text || buffer || (msg.message ? '⚠ ' + msg.message : '');
+          finishGeneration(sid, assistantIdx, finalText, stats);
+          rememberTurnStats(
+            sid,
+            msg.tokens_generated || tokenCount,
+            (msg.elapsed_ms || 0) / 1000,
+            Number(msg.tokens_per_sec || 0),
+            Number(msg.context_used),
+            Number(msg.context_limit),
+          );
+
+          if (sid === activeSessionId) {
+            renderStatsForSession(sid);
+          }
+
+          try { await reader.cancel(); } catch (_) {}
+          return true;
+        }
+      } catch (_) {}
+
+      return false;
+    };
+
     while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        partial += decoder.decode();
+        break;
+      }
       partial += decoder.decode(value, { stream: true });
 
       // 按 \n\n 分割SSE事件
@@ -1054,40 +1237,31 @@ async function sendMessage() {
       partial = events.pop(); // 最后一段可能不完整，保留
 
       for (const event of events) {
-        if (!event.startsWith('data:')) continue;
-        const jsonStr = event.replace(/^data:\s*/, '');
-        try {
-          const msg = JSON.parse(jsonStr);
-          if (msg.type === 'token') {
-            buffer = msg.text;   // 服务端发来的是全量累积文本，直接替换
-            tokenCount++;
-            updateStreamingBubble(sid, assistantIdx, buffer, false);
-            // ★ 只在当前显示此会话时才更新统计面板，避免污染其他会话的数据
-            if (sid === activeSessionId) {
-              const elapsed = (Date.now() - startMs) / 1000;
-              document.getElementById('stat-tokens').textContent = tokenCount;
-              document.getElementById('stat-speed').textContent =
-                elapsed > 0 ? (tokenCount / elapsed).toFixed(1) + ' tok/s' : '—';
-            }
-          } else if (msg.type === 'done') {
-            const stats = `${msg.tokens_generated} tokens · ${(msg.elapsed_ms/1000).toFixed(2)}s · ${msg.tokens_per_sec.toFixed(1)} tok/s${msg.cancelled ? ' · 已取消' : ''}`;
-            finishGeneration(sid, assistantIdx, msg.full_text || buffer, stats);
-            // ★ 只在当前显示此会话时才更新统计面板，避免 totalTokensThisSession 被后台会话污染
-            if (sid === activeSessionId) {
-              document.getElementById('stat-time').textContent = (msg.elapsed_ms/1000).toFixed(2) + 's';
-              totalTokensThisSession += msg.tokens_generated;
-              document.getElementById('stat-tokens').textContent = totalTokensThisSession;
-              document.getElementById('stat-speed').textContent = msg.tokens_per_sec.toFixed(1) + ' tok/s';
-            }
-          }
-        } catch (_) {}
+        if (await processEvent(event)) {
+          return;
+        }
       }
     }
+
+    if (partial.trim()) {
+      await processEvent(partial);
+    }
+
+    if (!receivedDone && sessions[sid]?.generating) {
+      delete activeStreamRequests[sid];
+      const fallbackStats = tokenCount > 0 ? `${tokenCount} tokens · 连接提前结束` : '连接提前结束';
+      finishGeneration(sid, assistantIdx, buffer || '⚠ 推理连接已结束', fallbackStats);
+    }
   } catch (e) {
+    if (streamState.aborted) {
+      return;
+    }
+
+    delete activeStreamRequests[sid];
     if (sessions[sid]?.generating) {
-      // 只有推理真正在进行时才显示错误
-      updateStreamingBubble(sid, assistantIdx, '⚠ 推理中断: ' + e.message, true);
-      finishGeneration(sid, assistantIdx, '', null);
+      const fallbackText = buffer || ('⚠ 推理中断: ' + e.message);
+      const fallbackStats = tokenCount > 0 ? `${tokenCount} tokens · 推理中断` : null;
+      finishGeneration(sid, assistantIdx, fallbackText, fallbackStats);
     }
   }
 }
@@ -1097,7 +1271,9 @@ function finishGeneration(sid, assistantIdx, finalText, stats) {
   if (sessions[sid]) sessions[sid].generating = false;
 
   // updateStreamingBubble 会先把 content 写入 msgHistory，再更新 DOM（如可见）
-  updateStreamingBubble(sid, assistantIdx, finalText || '（无内容）', true);
+  const historyText = msgHistory[sid]?.[assistantIdx]?.content || '';
+  const resolvedText = finalText || historyText || '（无内容）';
+  updateStreamingBubble(sid, assistantIdx, resolvedText, true);
 
   // 把 stats 写入 msgHistory，下次 renderMessages 时会自动渲染
   if (stats && msgHistory[sid] && msgHistory[sid][assistantIdx] !== undefined) {
@@ -1140,9 +1316,12 @@ function finishGeneration(sid, assistantIdx, finalText, stats) {
 async function stopGeneration() {
   // ★ 只停止当前可见会话，不影响其他正在推理的会话
   if (!activeSessionId) return;
+
+  const sid = activeSessionId;
   try {
-    await fetch(`/api/sessions/${activeSessionId}/stop`, { method: 'POST' });
-    showToast('已发送停止指令', 'success');
+    await requestStopFromServer(sid);
+    const cancelled = await cancelActiveStream(sid, '已手动停止', '⚠ 已停止当前输出');
+    showToast(cancelled ? '已停止当前输出' : '已发送停止指令', 'success');
   } catch (e) {
     showToast('停止失败: ' + e.message, 'error');
   }

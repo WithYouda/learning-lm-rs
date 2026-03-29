@@ -76,6 +76,8 @@ mod test{
         // compare benchmark 默认直接对接当前仓库内的 llama.cpp 命令与量化模型。
         set_env_default("LLAMA_CPP_CLI", "llama-cli");
         set_env_default("LLAMA_CPP_MODEL", default_llamacpp_model_path().into_os_string());
+        // compare benchmark 默认强制 CPU-only，避免误把 GPU offload 结果当作 CPU 基线。
+        set_env_default("LMRS_LLAMA_CPP_NGL", "0");
     }
 
     fn bench_rounds() -> usize {
@@ -92,6 +94,13 @@ mod test{
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(64)
+    }
+
+    fn bench_llamacpp_ngl() -> String {
+        std::env::var("LMRS_LLAMA_CPP_NGL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "0".to_string())
     }
 
     fn bench_steady_state_warmup_enabled() -> bool {
@@ -339,6 +348,7 @@ mod test{
         apply_benchmark_defaults();
         let cli = std::env::var("LLAMA_CPP_CLI").ok()?;
         let model = std::env::var("LLAMA_CPP_MODEL").ok()?;
+        let ngl = bench_llamacpp_ngl();
 
         // 对照 benchmark 允许短暂重试：llama-cli 在高负载下可能偶发被 OOM killer 杀掉，
         // 这不是解析逻辑问题，重试一次通常可恢复。
@@ -368,6 +378,8 @@ mod test{
                     "40",
                     "--repeat-penalty",
                     "1.05",
+                    "-ngl",
+                    ngl.as_str(),
                     "-st",
                     "--simple-io",
                     "--log-disable",
@@ -445,13 +457,14 @@ mod test{
             }
 
             last_diag = format!(
-                "attempt: {}\nstatus: {}\ncli: {}\nmodel: {}\ndecode_steps: {}\nthreads: {}\nprompt_len_bytes: {}\n--- stdout ---\n{}\n--- stderr ---\n{}\n",
+                "attempt: {}\nstatus: {}\ncli: {}\nmodel: {}\ndecode_steps: {}\nthreads: {}\nngl: {}\nprompt_len_bytes: {}\n--- stdout ---\n{}\n--- stderr ---\n{}\n",
                 attempt,
                 output.status,
                 cli,
                 model,
                 decode_steps,
                 threads,
+                ngl,
                 prompt.len(),
                 stdout,
                 stderr,
@@ -581,6 +594,7 @@ mod test{
         println!("[compare] runtime: {}", runtime::cpu::runtime_tuning_summary());
         println!("[compare] llamacpp_cli: {}", std::env::var("LLAMA_CPP_CLI").unwrap_or_else(|_| "unset".to_string()));
         println!("[compare] llamacpp_model: {}", std::env::var("LLAMA_CPP_MODEL").unwrap_or_else(|_| "unset".to_string()));
+        println!("[compare] llamacpp_ngl: {}", bench_llamacpp_ngl());
         println!("[compare] rounds: {}", rounds);
         println!("[compare] decode_steps: {}", decode_steps);
         println!("[compare] mode: interleaved");
@@ -627,6 +641,7 @@ mod test{
         println!("[compare-continuous] runtime: {}", runtime::cpu::runtime_tuning_summary());
         println!("[compare-continuous] llamacpp_cli: {}", std::env::var("LLAMA_CPP_CLI").unwrap_or_else(|_| "unset".to_string()));
         println!("[compare-continuous] llamacpp_model: {}", std::env::var("LLAMA_CPP_MODEL").unwrap_or_else(|_| "unset".to_string()));
+        println!("[compare-continuous] llamacpp_ngl: {}", bench_llamacpp_ngl());
         println!("[compare-continuous] rounds: {}", rounds);
         println!("[compare-continuous] decode_steps: {}", decode_steps);
         println!("[compare-continuous] mode: continuous");

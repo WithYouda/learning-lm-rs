@@ -1,7 +1,6 @@
 use crate::model::config::RopeScaling;
 use crate::core::tensor::Tensor;
 use crate::model::params::Weight;
-use crate::runtime::cpu;
 use crate::core::operators::quant::generic::{
     matmul_transb_gguf_quant,
     matmul_transb_gguf_quant_batch2,
@@ -11,13 +10,14 @@ use num_traits::float::Float;
 use num_traits::Num;
 use num_traits::{FromPrimitive, ToPrimitive};
 use gemm::{Parallelism};
-use rayon::prelude::*;
+use crate::runtime::threadpool;
 
 use std::fmt::Debug;
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// RoPE 频率缓存键：按维度、theta、缩放参数等区分
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct RopeFreqKey {
     d: usize,
@@ -31,6 +31,7 @@ struct RopeFreqKey {
 
 static ROPE_INV_FREQ_CACHE: OnceLock<Mutex<HashMap<RopeFreqKey, Arc<Vec<f32>>>>> = OnceLock::new();
 
+/// 构建 RoPE 逆频率向量，支持 Llama 3 的分段缩放策略
 #[inline]
 fn build_rope_inv_freqs(
     d: usize,
@@ -84,6 +85,7 @@ fn build_rope_inv_freqs(
     out
 }
 
+/// 带缓存的 RoPE 逆频率获取，避免重复计算
 #[inline]
 fn rope_inv_freqs_cached(
     d: usize,
@@ -160,6 +162,7 @@ unsafe fn rms_norm_apply_f32_avx2(y: &mut [f32], x: &[f32], w: &[f32], inv_rms: 
     }
 }
 
+/// 计算 f32 向量的平方和，自动选择 AVX512/FMA+AVX2/标量路径
 #[inline]
 fn sum_squares_f32_simd(x: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -294,9 +297,8 @@ unsafe fn sum_squares_f32_neon(x: &[f32]) -> f32 {
 }
 
 
-/// 可性能优化！
-/// 
-/// get (row) vectors from a 2D table given a list of indices
+/// 从嵌入表中按索引查找向量（Embedding Lookup）。
+/// 根据 indices 中的 token_id 从 table 中取出对应的嵌入向量，拼接到 y 中。
 pub fn gather<T>(y: &mut Tensor<T>, indices: &Tensor<u32>, table: &Tensor<T>) 
     where T: Default + Num + Copy + Float
 {
@@ -317,7 +319,7 @@ pub fn gather<T>(y: &mut Tensor<T>, indices: &Tensor<u32>, table: &Tensor<T>)
 /// RoPE: Rotary Positional Embedding 旋转位置编码
 /// 需要性能优化
 pub fn rope<T>(y: &mut Tensor<T>, start_pos: usize, theta: f32, scaling: &RopeScaling) 
-    where T: Float + Default + FromPrimitive +  Copy + Into<f32>
+    where T: Float + Default + FromPrimitive +  Copy + Into<f32> + Send
 {
     let shape = y.shape();
     assert!(shape.len() == 3);
@@ -347,6 +349,39 @@ pub fn rope<T>(y: &mut Tensor<T>, start_pos: usize, theta: f32, scaling: &RopeSc
     );
     let mut sin_cache = vec![0.0f32; half];
     let mut cos_cache = vec![0.0f32; half];
+
+    // prefill (seq_len > 1) 时按 token 并行
+    if seq_len > 1 && threadpool::num_threads() > 1 {
+        let tok_stride = n_heads * d;
+        threadpool::parallel_chunks_mut(data, tok_stride, |tok, tok_data| {
+            let pos = start_pos + tok;
+            let pos_f32 = pos as f32;
+            let mut local_sin = vec![0.0f32; half];
+            let mut local_cos = vec![0.0f32; half];
+            for i in 0..half {
+                let phase = pos_f32 * inv_freqs[i];
+                let (s, c) = phase.sin_cos();
+                local_sin[i] = s;
+                local_cos[i] = c;
+            }
+            for head in 0..n_heads {
+                let base_offset = head * d;
+                for i in 0..half {
+                    let idx_a = base_offset + i;
+                    let idx_b = base_offset + i + half;
+                    let a_f32: f32 = tok_data[idx_a].into();
+                    let b_f32: f32 = tok_data[idx_b].into();
+                    let sin = local_sin[i];
+                    let cos = local_cos[i];
+                    let new_a = a_f32 * cos - b_f32 * sin;
+                    let new_b = b_f32 * cos + a_f32 * sin;
+                    tok_data[idx_a] = T::from(new_a).unwrap_or(T::zero());
+                    tok_data[idx_b] = T::from(new_b).unwrap_or(T::zero());
+                }
+            }
+        });
+        return;
+    }
 
     for tok in 0..seq_len {
         let pos = start_pos + tok;
@@ -396,10 +431,7 @@ pub fn masked_softmax<T>(y: &mut Tensor<T>)
     // f32 快路径：避免反复 to_f32/from_f32 和临时 exp buffer。
     if TypeId::of::<T>() == TypeId::of::<f32>() {
         let data_f32 = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut f32, data.len()) };
-        data_f32
-            .par_chunks_mut(total_seq_len)
-            .enumerate()
-            .for_each(|(row_idx, row)| {
+        threadpool::parallel_chunks_mut(data_f32, total_seq_len, |row_idx, row| {
                 let i = row_idx % seq_len;
                 let boundary = total_seq_len - seq_len + i + 1;
 
@@ -494,17 +526,27 @@ pub fn rms_norm<T>(y: &mut Tensor<T>, x: &Tensor<T>, w: &Tensor<T>, epsilon: imp
         let eps = epsilon.to_f32().unwrap_or(0.0);
         let inv_hidden = 1.0f32 / hidden_size as f32;
 
-        for b in 0..batch {
-            let base = b * seq_len * hidden_size;
-            for l in 0..seq_len {
-                let offset = base + l * hidden_size;
+        let total_rows = batch * seq_len;
+        if total_rows > 1 && threadpool::num_threads() > 1 {
+            // prefill (多行)：按行并行
+            threadpool::parallel_chunks_mut(y_f32, hidden_size, |row_idx, y_row| {
+                let offset = row_idx * hidden_size;
                 let x_row = &x_f32[offset..offset + hidden_size];
-                let y_row = &mut y_f32[offset..offset + hidden_size];
                 let sum_sq = sum_squares_f32_simd(x_row);
                 let inv_rms = 1.0f32 / (sum_sq * inv_hidden + eps).sqrt();
-
-                // RMS norm 内循环：y[i] = x[i] * w[i] * inv_rms，使用 SIMD 加速
                 rms_norm_apply_f32_simd(y_row, x_row, w_f32, inv_rms);
+            });
+        } else {
+            for b in 0..batch {
+                let base = b * seq_len * hidden_size;
+                for l in 0..seq_len {
+                    let offset = base + l * hidden_size;
+                    let x_row = &x_f32[offset..offset + hidden_size];
+                    let y_row = &mut y_f32[offset..offset + hidden_size];
+                    let sum_sq = sum_squares_f32_simd(x_row);
+                    let inv_rms = 1.0f32 / (sum_sq * inv_hidden + eps).sqrt();
+                    rms_norm_apply_f32_simd(y_row, x_row, w_f32, inv_rms);
+                }
             }
         }
         return;
@@ -537,6 +579,44 @@ pub fn rms_norm<T>(y: &mut Tensor<T>, x: &Tensor<T>, w: &Tensor<T>, epsilon: imp
     }
 }
 
+/// f32 SiLU 内核：y[i] *= x[i] / (1 + exp(-x[i]))
+/// 自动选择 AVX2 或标量路径。
+#[inline]
+fn silu_f32_chunk(y: &mut [f32], x: &[f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                use std::arch::x86_64::*;
+                let n = y.len();
+                let mut i = 0usize;
+                while i + 8 <= n {
+                    let mut s = [0.0f32; 8];
+                    for j in 0..8 {
+                        let xv = x[i + j];
+                        s[j] = xv / (1.0 + (-xv).exp());
+                    }
+                    let vy = _mm256_loadu_ps(y.as_ptr().add(i));
+                    let vs = _mm256_loadu_ps(s.as_ptr());
+                    let out = _mm256_mul_ps(vy, vs);
+                    _mm256_storeu_ps(y.as_mut_ptr().add(i), out);
+                    i += 8;
+                }
+                while i < n {
+                    let xv = x[i];
+                    y[i] *= xv / (1.0 + (-xv).exp());
+                    i += 1;
+                }
+            }
+            return;
+        }
+    }
+    for i in 0..y.len() {
+        let xv = x[i];
+        y[i] *= xv / (1.0 + (-xv).exp());
+    }
+}
+
 /// f32 转换计算改造完成
 /// y = sigmoid(x) * x * y
 /// Swish/SiLU 激活函数
@@ -550,40 +630,19 @@ pub fn silu<T>(y: &mut Tensor<T>, x: &Tensor<T>)
     if TypeId::of::<T>() == TypeId::of::<f32>() {
         let y_f32 = unsafe { std::slice::from_raw_parts_mut(y_data.as_mut_ptr() as *mut f32, y_data.len()) };
         let x_f32 = unsafe { std::slice::from_raw_parts(x_data.as_ptr() as *const f32, x_data.len()) };
+        let n = y_f32.len();
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::is_x86_feature_detected!("avx2") {
-                // SAFETY: 运行时已检测 avx2。
-                unsafe {
-                    use std::arch::x86_64::*;
-                    let mut i = 0usize;
-                    let n = y_f32.len();
-                    while i + 8 <= n {
-                        let mut s = [0.0f32; 8];
-                        for j in 0..8 {
-                            let xv = x_f32[i + j];
-                            s[j] = xv / (1.0 + (-xv).exp());
-                        }
-                        let vy = _mm256_loadu_ps(y_f32.as_ptr().add(i));
-                        let vs = _mm256_loadu_ps(s.as_ptr());
-                        let out = _mm256_mul_ps(vy, vs);
-                        _mm256_storeu_ps(y_f32.as_mut_ptr().add(i), out);
-                        i += 8;
-                    }
-                    while i < n {
-                        let xv = x_f32[i];
-                        y_f32[i] *= xv / (1.0 + (-xv).exp());
-                        i += 1;
-                    }
-                }
-                return;
-            }
-        }
-
-        for i in 0..y_f32.len() {
-            let xv = x_f32[i];
-            y_f32[i] *= xv / (1.0 + (-xv).exp());
+        // 当数据量足够大时（prefill 场景），按块并行
+        let nthreads = threadpool::num_threads();
+        if n > 4096 && nthreads > 1 {
+            let chunk_size = (n + nthreads - 1) / nthreads;
+            threadpool::parallel_chunks_mut(y_f32, chunk_size, |chunk_idx, y_chunk| {
+                let start = chunk_idx * chunk_size;
+                let x_chunk = &x_f32[start..start + y_chunk.len()];
+                silu_f32_chunk(y_chunk, x_chunk);
+            });
+        } else {
+            silu_f32_chunk(y_f32, x_f32);
         }
         return;
     }
@@ -597,10 +656,8 @@ pub fn silu<T>(y: &mut Tensor<T>, x: &Tensor<T>)
     });
 }
 
-/// Matrix multiply with weight dispatch.
-///
-/// This is the key entry for real quantized inference:
-/// - dense weights -> existing float matmul path
+/// 矩阵乘法分发器：根据权重类型走密集或量化路径。
+/// 这是量化推理的核心入口：密集权重走 gemm，量化权重走 GGUF 量化内核。
 pub fn matmul_transb_weight<T>(
     c: &mut Tensor<T>,
     beta: T,
@@ -616,6 +673,8 @@ pub fn matmul_transb_weight<T>(
     }
 }
 
+/// 双权重矩阵乘法批处理（用于 gate/up 共享输入的场景）。
+/// gate 和 up 共享同一份输入，prefill 走批量调度以复用量化激活值，减少重复计算。
 pub fn matmul_transb_weight_batch2<T>(
     c0: &mut Tensor<T>,
     c1: &mut Tensor<T>,
@@ -648,14 +707,25 @@ pub fn matmul_transb_weight_batch2<T>(
             matmul_transb_gguf_quant_batch2(c0, c1, beta, a, wq0, wq1, alpha)
         }
         _ => {
-            rayon::join(
-                || matmul_transb_weight(c0, beta, a, b0, alpha),
-                || matmul_transb_weight(c1, beta, a, b1, alpha),
-            );
+            // decode 单 token (M=1)：各 matmul 内部已通过 parallel_iter_mut 并行化，
+            // 此处 join 只会创建无谓的 OS 线程（par_lock 导致各 matmul 仍串行执行），
+            // 直接顺序调用消除线程创建开销。
+            let ndim = a.shape().len();
+            if ndim >= 2 && a.shape()[ndim - 2] <= 1 {
+                matmul_transb_weight(c0, beta, a, b0, alpha);
+                matmul_transb_weight(c1, beta, a, b1, alpha);
+            } else {
+                threadpool::join(
+                    || matmul_transb_weight(c0, beta, a, b0, alpha),
+                    || matmul_transb_weight(c1, beta, a, b1, alpha),
+                );
+            }
         }
     }
 }
 
+/// 三权重矩阵乘法批处理（用于 QKV 三个投影共享输入的场景）。
+/// QKV 投影共享同一份 hidden_states，prefill 时复用激活值量化结果。
 pub fn matmul_transb_weight_batch3<T>(
     c0: &mut Tensor<T>,
     c1: &mut Tensor<T>,
@@ -683,15 +753,22 @@ pub fn matmul_transb_weight_batch3<T>(
             matmul_transb_gguf_quant_batch3(c0, c1, c2, beta, a, wq0, wq1, wq2, alpha)
         }
         _ => {
-            rayon::join(
-                || matmul_transb_weight(c0, beta, a, b0, alpha),
-                || {
-                    rayon::join(
-                        || matmul_transb_weight(c1, beta, a, b1, alpha),
-                        || matmul_transb_weight(c2, beta, a, b2, alpha),
-                    );
-                },
-            );
+            let ndim = a.shape().len();
+            if ndim >= 2 && a.shape()[ndim - 2] <= 1 {
+                matmul_transb_weight(c0, beta, a, b0, alpha);
+                matmul_transb_weight(c1, beta, a, b1, alpha);
+                matmul_transb_weight(c2, beta, a, b2, alpha);
+            } else {
+                threadpool::join(
+                    || matmul_transb_weight(c0, beta, a, b0, alpha),
+                    || {
+                        threadpool::join(
+                            || matmul_transb_weight(c1, beta, a, b1, alpha),
+                            || matmul_transb_weight(c2, beta, a, b2, alpha),
+                        );
+                    },
+                );
+            }
         }
     }
 }
@@ -727,29 +804,67 @@ pub fn matmul_transb<T>(c: &mut Tensor<T>, beta: T, a: &Tensor<T>, b: &Tensor<T>
     assert!(a_row == c_row);
 
     // Fast path: call gemm for f32.
+    // 当 M > 1（prefill）时，按行分区并行调用 gemm，替代 Parallelism::Rayon。
     if TypeId::of::<T>() == TypeId::of::<f32>() {
-        unsafe {
-            gemm::gemm(
-                c_row,
-                c_col,
-                a_col,
-                c.as_mut_ptr() as *mut f32,
-                1,
-                c_col as isize,
-                true,
-                a.as_ptr() as *const f32,
-                1,
-                a_col as isize,
-                b.as_ptr() as *const f32,
-                b_col as isize,
-                1,
-                beta.to_f32().unwrap_or(0.0),
-                alpha.to_f32().unwrap_or(0.0),
-                false,
-                false,
-                false,
-                Parallelism::Rayon(cpu::prefill_threads()),
-            );
+        let nthreads = threadpool::num_threads();
+        let beta_f32 = beta.to_f32().unwrap_or(0.0);
+        let alpha_f32 = alpha.to_f32().unwrap_or(0.0);
+        let c_f32 = unsafe { std::slice::from_raw_parts_mut(c.as_mut_ptr() as *mut f32, c.len()) };
+        let a_f32 = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const f32, a.len()) };
+        let b_f32 = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const f32, b.len()) };
+
+        if c_row > 1 && nthreads > 1 {
+            // 按行分区：每个线程处理一段连续的 M 行
+            threadpool::parallel_chunks_mut(c_f32, c_col, |row_idx, c_row_slice| {
+                let a_offset = row_idx * a_col;
+                unsafe {
+                    gemm::gemm(
+                        1,
+                        c_col,
+                        a_col,
+                        c_row_slice.as_mut_ptr(),
+                        1,
+                        c_col as isize,
+                        true,
+                        a_f32.as_ptr().add(a_offset),
+                        1,
+                        a_col as isize,
+                        b_f32.as_ptr(),
+                        b_col as isize,
+                        1,
+                        beta_f32,
+                        alpha_f32,
+                        false,
+                        false,
+                        false,
+                        Parallelism::None,
+                    );
+                }
+            });
+        } else {
+            unsafe {
+                gemm::gemm(
+                    c_row,
+                    c_col,
+                    a_col,
+                    c_f32.as_mut_ptr(),
+                    1,
+                    c_col as isize,
+                    true,
+                    a_f32.as_ptr(),
+                    1,
+                    a_col as isize,
+                    b_f32.as_ptr(),
+                    b_col as isize,
+                    1,
+                    beta_f32,
+                    alpha_f32,
+                    false,
+                    false,
+                    false,
+                    Parallelism::None,
+                );
+            }
         }
         return;
     }

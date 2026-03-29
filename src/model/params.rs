@@ -8,13 +8,16 @@ use safetensors::SafeTensors;
 
 
 
-/// A model weight can either be a classic dense tensor or a quantized matrix.
+/// 模型权重的枚举类型：支持密集张量和 GGUF 量化张量两种形式。
+/// Dense: 标准 f32 张量（用于 safetensors 加载或调试）
+/// GgufQ: GGUF 原生量化张量（支持 Q4K/Q6K/Q8K 等多种格式）
 pub enum Weight<T> {
     Dense(Tensor<T>),
     GgufQ(QuantGGUFTensor),
 }
 
 impl<T> Weight<T> {
+    /// 将权重强制解包为密集张量引用，量化权重会 panic
     #[allow(unused)]
     pub fn as_dense(&self) -> &Tensor<T> {
         match self {
@@ -24,34 +27,32 @@ impl<T> Weight<T> {
     }
 }
 
+/// Llama 模型的所有可训练参数集合。
+/// 包含嵌入表、每层的注意力权重、FFN 权重、输出投影等。
 pub struct LLamaParams<T> {
-    // token_id to embedding lookup table
-    // (vocab_size, dim)
+    /// 嵌入查找表 (vocab_size, hidden_size)
     pub embedding_table: Tensor<T>, 
-    // decoder layer 解码器层
-    // (hidden_size, ) x layers
+    /// 注意力层前的 RMSNorm 权重 (hidden_size,) x layers
     pub rms_att_w: Vec<Tensor<T>>, 
-    // (n_heads * head_size, hidden_size) x layers
+    /// Q 投影权重 (n_heads * head_size, hidden_size) x layers
     pub wq: Vec<Weight<T>>,  
-    // (n_kv_heads * head_size, hidden_size) x layers      
+    /// K 投影权重 (n_kv_heads * head_size, hidden_size) x layers
     pub wk: Vec<Weight<T>>,   
-    // (n_kv_heads * head_size, hidden_size) x layers     
+    /// V 投影权重 (n_kv_heads * head_size, hidden_size) x layers
     pub wv: Vec<Weight<T>>,  
-    // (hidden_size, n_heads * head_size) x layers      
+    /// 输出投影权重 (hidden_size, n_heads * head_size) x layers
     pub wo: Vec<Weight<T>>,        
-    // ffn layer 前馈网络层
-    // (hidden_size, ) x layers
+    /// FFN 层前的 RMSNorm 权重 (hidden_size,) x layers
     pub rms_ffn_w: Vec<Tensor<T>>, 
-    // (intermediate_size, hidden_size) x layers
+    /// FFN 上投影权重 (intermediate_size, hidden_size) x layers
     pub w_up: Vec<Weight<T>>,      
-    // (intermediate_size, hidden_size) x layers
+    /// FFN 门控投影权重 (intermediate_size, hidden_size) x layers
     pub w_gate: Vec<Weight<T>>,   
-    // (hidden_size, intermediate_size) x layers 
+    /// FFN 下投影权重 (hidden_size, intermediate_size) x layers
     pub w_down: Vec<Weight<T>>,    
-    // output 输出层
-    // (hidden_size, )
+    /// 输出层前的 RMSNorm 权重 (hidden_size,)
     pub rms_out_w: Tensor<T>, 
-    // (vocab_size, dim)
+    /// 输出投影矩阵 (vocab_size, hidden_size)，可能与 embedding_table 绑定
     pub lm_head: Weight<T>,   
 }
 

@@ -3,6 +3,7 @@ use std::hint::black_box;
 use std::mem::{size_of, zeroed};
 use std::sync::OnceLock;
 
+/// 运行时调优报告，记录当前生效的线程、绑核、大页等配置
 #[derive(Clone, Debug)]
 pub struct RuntimeTuningReport {
 	pub threads: usize,
@@ -15,6 +16,7 @@ pub struct RuntimeTuningReport {
 	pub perf_event_paranoid: Option<i32>,
 }
 
+/// 运行时调优的内部配置（从环境变量解析）
 #[derive(Clone, Debug)]
 struct RuntimeTuningConfig {
 	threads: usize,
@@ -32,6 +34,7 @@ static PREFILL_WILLNEED_ENABLED: OnceLock<bool> = OnceLock::new();
 static PREFILL_PRETOUCH_ENABLED: OnceLock<bool> = OnceLock::new();
 static PREFILL_PRETOUCH_MAX_BYTES: OnceLock<usize> = OnceLock::new();
 
+/// 读取布尔型环境变量，支持 1/true/yes/on 等写法，未设置时返回 default
 fn env_flag(name: &str, default: bool) -> bool {
 	std::env::var(name)
 		.ok()
@@ -39,6 +42,7 @@ fn env_flag(name: &str, default: bool) -> bool {
 		.unwrap_or(default)
 }
 
+/// 解析 CPU 绑核掩码字符串（如 "0,1,2-4"），返回去重排序后的 CPU 编号列表
 fn parse_cpu_mask(mask: &str) -> Vec<usize> {
 	let mut cpus = Vec::new();
 	for part in mask.split(',') {
@@ -65,6 +69,7 @@ fn parse_cpu_mask(mask: &str) -> Vec<usize> {
 	cpus
 }
 
+/// 解析线程数：优先 LMRS_THREADS > RAYON_NUM_THREADS > 系统可用核心数
 fn parse_threads() -> usize {
 	std::env::var("LMRS_THREADS")
 		.ok()
@@ -79,6 +84,7 @@ fn parse_threads() -> usize {
 		.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
 }
 
+/// 解析 prefill 专用线程数（LMRS_PREFILL_THREADS），未设置时使用 default
 fn parse_prefill_threads(default: usize) -> usize {
 	std::env::var("LMRS_PREFILL_THREADS")
 		.ok()
@@ -87,6 +93,7 @@ fn parse_prefill_threads(default: usize) -> usize {
 		.unwrap_or(default)
 }
 
+/// 读取 Linux 透明大页（THP）当前模式（always/madvise/never）
 fn current_thp_mode() -> Option<String> {
 	let raw = fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").ok()?;
 	for token in raw.split_whitespace() {
@@ -97,6 +104,7 @@ fn current_thp_mode() -> Option<String> {
 	Some(raw.trim().to_string())
 }
 
+/// 读取 /proc/sys/kernel/perf_event_paranoid 值，判断性能计数器可用性
 fn current_perf_event_paranoid() -> Option<i32> {
 	fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
 		.ok()?
@@ -105,6 +113,7 @@ fn current_perf_event_paranoid() -> Option<i32> {
 		.ok()
 }
 
+/// 从环境变量汇总解析出完整的运行时调优配置
 fn runtime_config_from_env() -> RuntimeTuningConfig {
 	let threads = parse_threads();
 	let cpu_mask = std::env::var("LMRS_CPU_MASK")
@@ -127,6 +136,7 @@ fn runtime_config_from_env() -> RuntimeTuningConfig {
 	}
 }
 
+/// 将当前线程绑定到指定 CPU 核心（Linux 下调用 sched_setaffinity）
 #[cfg(target_os = "linux")]
 fn bind_current_thread(cpu: usize) -> std::io::Result<()> {
 	unsafe {
@@ -142,11 +152,13 @@ fn bind_current_thread(cpu: usize) -> std::io::Result<()> {
 	}
 }
 
+/// 非 Linux 平台的绑核空实现
 #[cfg(not(target_os = "linux"))]
 fn bind_current_thread(_cpu: usize) -> std::io::Result<()> {
 	Ok(())
 }
 
+/// 按线程索引循环分配 CPU 核心并绑定（index % cpus.len()）
 fn bind_thread_for_index(cpus: &[usize], index: usize) {
 	if cpus.is_empty() {
 		return;
@@ -157,6 +169,9 @@ fn bind_thread_for_index(cpus: &[usize], index: usize) {
 	}
 }
 
+/// 初始化运行时线程池与绑核策略，确保仅执行一次。
+/// 解析 LMRS_THREADS、LMRS_CPU_MASK、LMRS_ENABLE_AFFINITY 等环境变量，
+/// 初始化自定义全局线程池并将每个工作线程绑定到指定 CPU 核心。
 pub fn init_runtime_tuning() -> &'static RuntimeTuningReport {
 	RUNTIME_TUNING.get_or_init(|| {
 		let config = runtime_config_from_env();
@@ -176,22 +191,28 @@ pub fn init_runtime_tuning() -> &'static RuntimeTuningReport {
 		HUGEPAGE_HINT_ENABLED.get_or_init(|| config.hugepage_hint_enabled);
 		HUGEPAGE_THRESHOLD_BYTES.get_or_init(|| config.hugepage_threshold_bytes);
 
-		let build_result = rayon::ThreadPoolBuilder::new()
-			.num_threads(config.threads.max(config.prefill_threads))
-			.start_handler({
-				let cpus = config.cpu_mask.clone();
-				let affinity_enabled = config.affinity_enabled;
-				move |index| {
-					if affinity_enabled {
-						bind_thread_for_index(&cpus, index);
-					}
-				}
-			})
-			.build_global();
-
-		if let Err(err) = build_result {
-			eprintln!("[runtime] rayon 全局线程池保持默认配置: {}", err);
+		let total_threads = config.threads.max(config.prefill_threads);
+		{
+			let cpus = config.cpu_mask.clone();
+			let affinity_enabled = config.affinity_enabled;
+			super::threadpool::init(
+				total_threads,
+				if affinity_enabled {
+					Some(std::sync::Arc::new(move |worker_idx| {
+						// worker_idx 从 0 开始，主线程为 index 0，
+						// 工作线程从 index 1 起
+						bind_thread_for_index(&cpus, worker_idx + 1);
+					}))
+				} else {
+					None
+				},
+			);
 		}
+		// 限制 rayon 全局池为 1 线程，避免 gemm 传递依赖创建默认线程池
+		// 与我们的线程池竞争 CPU 资源
+		let _ = rayon::ThreadPoolBuilder::new()
+			.num_threads(1)
+			.build_global();
 
 		if config.affinity_enabled {
 			bind_thread_for_index(&config.cpu_mask, 0);
@@ -228,14 +249,17 @@ pub fn runtime_tuning_summary() -> String {
 	)
 }
 
+/// 获取 prefill 阶段使用的线程数
 pub fn prefill_threads() -> usize {
 	init_runtime_tuning().prefill_threads
 }
 
+/// 检查 perf_event_paranoid 是否允许用户级性能计数器
 pub fn perf_counter_available() -> bool {
 	current_perf_event_paranoid().map(|v| v <= 2).unwrap_or(false)
 }
 
+/// 对大内存分配尝试应用透明大页 (THP) 建议，以降低 TLB 未命中率
 pub fn maybe_advise_hugepage(ptr: *mut u8, bytes: usize) {
 	if bytes == 0 {
 		return;
@@ -264,6 +288,8 @@ pub fn maybe_advise_hugepage(ptr: *mut u8, bytes: usize) {
 	}
 }
 
+/// Prefill 前尝试预触页/madvise 权重内存，减少 page fault。
+/// 默认关闭，需显式设置 LMRS_ENABLE_PREFILL_WILLNEED/PRETOUCH 开启。
 pub fn maybe_prepare_prefill_weight_pages(ptr: *const u8, bytes: usize) {
 	if bytes == 0 {
 		return;

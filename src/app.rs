@@ -7,6 +7,7 @@ use crate::chat::templates;
 use crate::model::llama;
 use crate::runtime::cpu;
 
+/// 聊天接口的采样参数配置
 #[derive(Clone, Copy, Debug)]
 pub struct ChatSamplingConfig {
     pub max_len: usize,
@@ -16,18 +17,21 @@ pub struct ChatSamplingConfig {
     pub penalty: f32,
 }
 
+/// 聊天后端类型：GGUF 量化模型或 safetensors 密集模型
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChatBackend {
     Gguf,
     Safetensors,
 }
 
+/// 设置环境变量默认值，仅在未设置时生效
 fn set_env_default(key: &str, value: &str) {
     if std::env::var_os(key).is_none() {
         std::env::set_var(key, value);
     }
 }
 
+/// 设置聊天场景的默认环境变量（线程数、绑核、GEMM 后端等）
 pub fn apply_chat_defaults() {
     // 交互聊天默认沿用当前 benchmark 已验证最优的 CPU 配置，避免线程抖动和绑核缺失把体验拖慢。
     set_env_default("LMRS_THREADS", "5");
@@ -40,6 +44,7 @@ pub fn apply_chat_defaults() {
     set_env_default("LMRS_HOT_MATRIX_CACHE_MB", "1");
 }
 
+/// 清理模型输出文本：去除空行、多余空格、角色标记等
 pub fn normalize_chat_reply(text: &str) -> String {
     text.lines()
         .map(str::trim)
@@ -51,6 +56,7 @@ pub fn normalize_chat_reply(text: &str) -> String {
         .to_string()
 }
 
+/// 默认聊天采样参数（稳定输出优先）
 pub fn default_chat_sampling() -> ChatSamplingConfig {
     ChatSamplingConfig {
         max_len: 50,
@@ -61,6 +67,7 @@ pub fn default_chat_sampling() -> ChatSamplingConfig {
     }
 }
 
+/// 将调用方的采样参数收敛为稳定配置，防止随机采样导致聊天结果发散
 pub fn stabilize_chat_sampling(
     max_len: usize,
     _top_p: f32,
@@ -88,6 +95,7 @@ pub fn stabilize_chat_sampling(
     }
 }
 
+/// 从环境变量读取 usize 值，读取失败或 <=0 时返回 default
 fn env_usize_or(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -96,6 +104,7 @@ fn env_usize_or(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// 从环境变量读取 u32 值，读取失败时返回 default
 fn env_u32_or(key: &str, default: u32) -> u32 {
     std::env::var(key)
         .ok()
@@ -103,6 +112,7 @@ fn env_u32_or(key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+/// 从环境变量读取 f32 值，读取失败时返回 default
 fn env_f32_or(key: &str, default: f32) -> f32 {
     std::env::var(key)
         .ok()
@@ -110,6 +120,7 @@ fn env_f32_or(key: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+/// 从环境变量读取聊天后端类型（gguf/safetensors），读取失败时返回 default
 fn env_backend_or(key: &str, default: ChatBackend) -> ChatBackend {
     match std::env::var(key).ok().as_deref() {
         Some("safetensors") | Some("safetensor") | Some("st") => ChatBackend::Safetensors,
@@ -118,6 +129,7 @@ fn env_backend_or(key: &str, default: ChatBackend) -> ChatBackend {
     }
 }
 
+/// 从环境变量加载 CLI 聊天配置（LMRS_CHAT_MAX_LEN/TOP_P/TOP_K/TEMPERATURE/PENALTY）
 pub fn load_chat_cli_config() -> ChatSamplingConfig {
     let defaults = default_chat_sampling();
     // 命令行聊天入口默认使用稳定配置；如需临时覆盖，可通过环境变量调整。
@@ -130,10 +142,12 @@ pub fn load_chat_cli_config() -> ChatSamplingConfig {
     }
 }
 
+/// 从环境变量加载聊天后端类型（LMRS_CHAT_BACKEND，默认 gguf）
 pub fn load_chat_backend() -> ChatBackend {
     env_backend_or("LMRS_CHAT_BACKEND", ChatBackend::Gguf)
 }
 
+/// safetensors 密集模型的一次性结果生成入口
 pub fn story(
     max_len: usize,
     top_p: f32,
@@ -162,6 +176,7 @@ pub fn story(
     println!("{}", output);
 }
 
+/// safetensors 密集模型的交互式多轮对话入口
 pub fn chats(
     max_len: usize,
     top_p: f32,
@@ -229,6 +244,7 @@ pub fn chats(
     }
 }
 
+/// GGUF 量化模型的交互式多轮对话入口
 pub fn gguf_chats(
     max_len: usize,
     top_p: f32,
@@ -295,6 +311,7 @@ pub fn gguf_chats(
     }
 }
 
+/// CLI 聊天统一入口，根据环境变量自动选择 GGUF 或 safetensors 后端
 pub fn run_cli_chat() {
     let config = load_chat_cli_config();
     let backend = load_chat_backend();

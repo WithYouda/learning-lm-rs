@@ -87,6 +87,7 @@ impl QuantPrefillQ8KInterleaveLayout {
     }
 }
 
+/// Q4K prefill 元数据：每行的 d/dmin 缩放因子和 scales/mins 字节
 #[derive(Debug)]
 pub struct QuantQ4KPrefillMetadata {
     pub rows: usize,
@@ -97,6 +98,7 @@ pub struct QuantQ4KPrefillMetadata {
     pub mins: Vec<u8>,
 }
 
+/// Q6K prefill 元数据：每行的 d 缩放因子和 scales
 #[derive(Debug)]
 pub struct QuantQ6KPrefillMetadata {
     pub rows: usize,
@@ -105,6 +107,7 @@ pub struct QuantQ6KPrefillMetadata {
     pub scales: Vec<i8>,
 }
 
+/// Prefill 量化元数据的枚举：目前覆盖 Q4K 和 Q6K 两种格式
 #[derive(Debug)]
 pub enum QuantPrefillKMetadata {
     Q4K(QuantQ4KPrefillMetadata),
@@ -214,7 +217,7 @@ impl QuantGGUFTensor {
     }
 }
 
-
+/// 在 GGUF 文件的元数据列表中按 key 查找值
 fn find_meta_value<'a>(gguf: &'a GGUFFile, key: &str) -> Option<&'a GGUFMetadataValue> {
     gguf.header
         .metadata
@@ -223,6 +226,7 @@ fn find_meta_value<'a>(gguf: &'a GGUFFile, key: &str) -> Option<&'a GGUFMetadata
         .map(|m| &m.value)
 }
 
+/// 从 GGUF 元数据读取无符号整数值，兼容 u8/u16/u32/u64/i* 类型
 fn meta_u64(gguf: &GGUFFile, key: &str) -> Option<u64> {
     match find_meta_value(gguf, key)? {
         GGUFMetadataValue::Uint8(v) => Some(*v as u64),
@@ -237,18 +241,22 @@ fn meta_u64(gguf: &GGUFFile, key: &str) -> Option<u64> {
     }
 }
 
+/// 从字节切片小端读取 u16
 fn read_le_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
 }
 
+/// 从字节切片小端读取 u32
 fn read_le_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 
+/// 从字节切片小端读取 u64
 fn read_le_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
+/// 向上对齐到 a 的倍数
 fn align_up(x: usize, a: usize) -> usize {
     if a == 0 {
         return x;
@@ -256,12 +264,14 @@ fn align_up(x: usize, a: usize) -> usize {
     (x + a - 1) & !(a - 1)
 }
 
+/// 跳过一个 GGUF 字符串字段（8字节长度 + 内容）
 fn skip_gguf_string(bytes: &[u8], idx: &mut usize) {
     let len = read_le_u64(bytes, *idx) as usize;
     *idx += 8;
     *idx += len;
 }
 
+/// 跳过一个 GGUF 元数据值（递归处理数组等复合类型）
 fn skip_metadata_value(bytes: &[u8], idx: &mut usize, value_type: GGUfMetadataValueType) {
     match value_type {
         GGUfMetadataValueType::Uint8 | GGUfMetadataValueType::Int8 | GGUfMetadataValueType::Bool => {
@@ -296,6 +306,7 @@ fn skip_metadata_value(bytes: &[u8], idx: &mut usize, value_type: GGUfMetadataVa
     }
 }
 
+/// 计算 GGUF 文件中张量数据区的起始字节偏移（跳过 header + metadata + tensor info）
 fn gguf_tensor_data_start(gguf: &GGUFFile, bytes: &[u8]) -> usize {
     let mut idx = 0usize;
     assert!(&bytes[idx..idx + 4] == b"GGUF");
@@ -379,6 +390,7 @@ fn build_qk_unpermute_row_map(rows: usize, n_heads: usize) -> Vec<usize> {
     map
 }
 
+/// 获取 prefill 阶段 dense workset 的内存预算（MB，通过 LMRS_PREFILL_WORKSET_MB 配置）
 #[inline]
 fn gguf_prefill_workset_budget_bytes() -> usize {
     std::env::var("LMRS_PREFILL_WORKSET_MB")
@@ -390,6 +402,7 @@ fn gguf_prefill_workset_budget_bytes() -> usize {
         * 1024
 }
 
+/// 获取 prefill 阶段量化条带布局的内存预算（MB，通过 LMRS_PREFILL_STRIPE_MB 配置）
 #[inline]
 fn gguf_prefill_stripe_budget_bytes() -> usize {
     std::env::var("LMRS_PREFILL_STRIPE_MB")
@@ -401,6 +414,7 @@ fn gguf_prefill_stripe_budget_bytes() -> usize {
         * 1024
 }
 
+/// 获取 prefill packed 主布局的内存预算（默认为 interleave + k_metadata 之和）
 #[inline]
 fn gguf_prefill_packed_budget_bytes() -> usize {
     std::env::var("LMRS_PREFILL_PACKED_MB")
@@ -413,6 +427,7 @@ fn gguf_prefill_packed_budget_bytes() -> usize {
         })
 }
 
+/// 获取 Q8K interleave 布局的内存预算（默认 0 = 禁用，实验功能）
     #[inline]
     fn gguf_prefill_q8k_interleave_budget_bytes() -> usize {
         // 阶段 D 先保留为实验能力：
@@ -425,6 +440,7 @@ fn gguf_prefill_packed_budget_bytes() -> usize {
         * 1024
     }
 
+/// 获取 K-quant 元数据布局的内存预算（默认 0 = 禁用，实验功能）
     #[inline]
     fn gguf_prefill_k_metadata_budget_bytes() -> usize {
         // 阶段 G 已实现，但 5 轮结果显示它不能默认保留在主路径；
@@ -437,6 +453,7 @@ fn gguf_prefill_packed_budget_bytes() -> usize {
         * 1024
     }
 
+/// 是否启用 gate/up 投影的加载期 dense workset（实验开关，默认关闭）
 #[inline]
 fn gguf_gateup_workset_enabled() -> bool {
     std::env::var("LMRS_PREFILL_GATEUP_WORKSET")
@@ -445,6 +462,7 @@ fn gguf_gateup_workset_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// 是否启用 FFN 层的量化条带常驻布局（实验开关，默认关闭）
 #[inline]
 fn gguf_ffn_stripes_enabled() -> bool {
     std::env::var("LMRS_PREFILL_FFN_STRIPES")
@@ -913,6 +931,7 @@ fn read_gguf_tensor_as_f32(
     Ok((data, shape))
 }
 
+/// 根据量化类型返回每个量化块的字节大小
 fn gguf_quant_block_size(t: GGMLType) -> Option<usize> {
     match t {
         GGMLType::Q4_0 => Some(2 + 16),
@@ -929,6 +948,7 @@ fn gguf_quant_block_size(t: GGMLType) -> Option<usize> {
     }
 }
 
+/// 根据量化类型返回每个量化块包含的元素数（qk）
 fn gguf_quant_qk(t: GGMLType) -> Option<usize> {
     match t {
         GGMLType::Q4_0 | GGMLType::Q4_1 | GGMLType::Q5_0 | GGMLType::Q5_1 | GGMLType::Q8_0 => Some(32),
@@ -937,6 +957,8 @@ fn gguf_quant_qk(t: GGMLType) -> Option<usize> {
     }
 }
 
+/// 从 GGUF 文件读取一个通用量化张量，构建 QuantGGUFTensor 容器。
+/// 支持 Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2K/Q3K/Q4K/Q5K/Q6K 等格式。
 fn read_gguf_generic_quant_tensor(
     gguf: &GGUFFile,
     bytes: &[u8],
